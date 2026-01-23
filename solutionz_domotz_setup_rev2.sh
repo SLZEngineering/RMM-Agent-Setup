@@ -1,8 +1,8 @@
 #!/bin/bash
 # ============================
 # Solutionz INC RMM Collector Image (Linux)
-# System Admin: Darrel Della
-# Last Updated: 2025-11-18
+# System Admin: Seneathia Williams
+# Last Updated: 2026-01-23
 # Description: Install and update the collector to Solutionz RMM configuration.
 # Custom MOTD for Ubuntu Minimal Server
 # ============================
@@ -43,7 +43,7 @@ echo "14. Update Banner"
 echo "------------------------------------------------------------"
 echo "Disclaimer:"
 echo
-echo "1. Purpose: This script is designed for Solutionz RMM Collector, created by Darrel Della, RMM Engineer."
+echo "1. Purpose: This script is designed for Solutionz RMM Collector, created by Seneathia Williams, RMM Engineer."
 echo "2. By proceeding, you confirm that:"
 echo "   - The script will modify system configurations and install necessary packages."
 echo "   - It may update system files and settings as per its instructions."
@@ -281,7 +281,7 @@ BANNER
 
 echo -e "${YELLOW}Welcome to the Solutionz RMM Collector Login.${NC}"
 echo "============================================================"
-echo "Solutionz RMM System Admin: Darrel Della '''\_(~_-)_/'''"
+echo "Solutionz RMM System Admin: Seneathia Williams '''\_(~_-)_/'''"
 echo "------------------------------------------------------------"
 hostnamectl
 echo "------------------------------------------------------------"
@@ -326,6 +326,10 @@ echo "   [+] Completion Time: $(date)"
 echo "   [+] Hostname: $(hostname)"
 echo "   [+] Script Version: v2.0"
 echo "------------------------------------------------------------"
+
+sudo update-grub
+sudo reboot
+
 
 sudo update-grub
 sudo reboot
