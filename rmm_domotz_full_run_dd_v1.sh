@@ -13,10 +13,6 @@ set -euo pipefail
 # =========================
 REPO_BASE="https://raw.githubusercontent.com/SLZEngineering/domotz-setup/main"
 
-SETUP_SCRIPT="solutionz_domotz_setup_rev2.sh"
-CONFIG_CHECK_SCRIPT="rmm_config_check_dd_v1.sh"
-COLLECTOR_CHECK_SCRIPT="rmm_collector_connection_check_dd_v1"   # no .sh
-
 DOMOTZ_SNAP="domotzpro-agent-publicstore"
 
 STATE_DIR="/var/lib/solutionz_rmm"
@@ -41,7 +37,6 @@ need_root() {
 }
 
 wait_for_snapd() {
-  # Wait up to ~2 minutes for snapd to become responsive
   for _ in {1..60}; do
     snap version >/dev/null 2>&1 && return 0
     sleep 2
@@ -50,7 +45,7 @@ wait_for_snapd() {
 }
 
 snap_is_installed() {
-  # Retry because snapd can be slow right after boot
+  # retry because snapd can be slow after boot
   for _ in {1..30}; do
     snap list "${DOMOTZ_SNAP}" >/dev/null 2>&1 && return 0
     sleep 2
@@ -78,12 +73,11 @@ ensure_prereqs() {
 }
 
 install_snap_phase1_then_stop() {
-  # OPTION B behavior: install snap and STOP (because it may reboot)
+  # OPTION B: install snap then STOP (snap install may reboot)
   say "Installing Domotz snap: ${DOMOTZ_SNAP}"
   snap install "${DOMOTZ_SNAP}" || true
 
-  # If we reach here, we can set a stage. If the box reboots mid-install, stage may remain unset,
-  # but after reboot snap detection + wait_for_snapd prevents loops.
+  # If we reach here, mark for post-snap continuation
   echo "post_snap" > "${STAGE_FILE}" || true
 
   say "PHASE 1 complete."
@@ -93,8 +87,6 @@ install_snap_phase1_then_stop() {
 }
 
 write_local_engine() {
-  # Local engine runs across reboots (systemd service ExecStart).
-  # This avoids the “stage mismatch” issues and avoids pulling remote code at boot.
   sudo tee /usr/local/sbin/solutionz_rmm_engine.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -126,6 +118,14 @@ STAGE_FILE="${STATE_DIR}/stage"
 RUN_DIR_FILE="${STATE_DIR}/run_dir"
 LOCK_FILE="${STATE_DIR}/lock"
 
+# Marker files (resilience if stage file is deleted)
+MARK_SETUP_STARTED="${STATE_DIR}/setup.started"
+MARK_SETUP_DONE="${STATE_DIR}/setup.done"
+MARK_CONFIG_STARTED="${STATE_DIR}/config.started"
+MARK_CONFIG_DONE="${STATE_DIR}/config.done"
+MARK_COLLECTOR_STARTED="${STATE_DIR}/collector.started"
+MARK_COLLECTOR_DONE="${STATE_DIR}/collector.done"
+
 LOGDIR="/var/log/solutionz_rmm"
 TS="$(date +%Y%m%d_%H%M%S)"
 LOGFILE="${LOGDIR}/domotz_engine_${TS}.log"
@@ -138,6 +138,10 @@ wait_for_snapd() {
     sleep 2
   done
   return 0
+}
+
+snap_is_installed() {
+  snap list "${DOMOTZ_SNAP}" >/dev/null 2>&1
 }
 
 download() {
@@ -162,6 +166,33 @@ read_stage() {
 
 write_stage() { echo "$1" > "${STAGE_FILE}"; }
 
+normalize_stage() {
+  local s="$1"
+  case "$s" in
+    setup_pending) echo "setup" ;;
+    config_pending) echo "config" ;;
+    collector_pending) echo "collector" ;;
+    post_snap) echo "setup" ;;
+    pre_snap) echo "pre_snap" ;;
+    "") echo "" ;;
+    *) echo "$s" ;;
+  esac
+}
+
+infer_stage_from_markers() {
+  # Highest precedence: done markers
+  if [[ -f "${MARK_COLLECTOR_DONE}" ]]; then echo "complete"; return; fi
+  if [[ -f "${MARK_CONFIG_DONE}" ]]; then echo "collector"; return; fi
+  if [[ -f "${MARK_SETUP_DONE}" ]]; then echo "config"; return; fi
+
+  # Started markers help recover if stage file is missing/deleted mid-run
+  if [[ -f "${MARK_COLLECTOR_STARTED}" ]]; then echo "collector"; return; fi
+  if [[ -f "${MARK_CONFIG_STARTED}" ]]; then echo "collector"; return; fi
+  if [[ -f "${MARK_SETUP_STARTED}" ]]; then echo "config"; return; fi
+
+  echo "setup"
+}
+
 do_connects_tun_restart() {
   wait_for_snapd
 
@@ -176,6 +207,7 @@ do_connects_tun_restart() {
 }
 
 run_setup_auto_yes() {
+  # auto-answer the two prompts in your setup script
   printf "yes\nyes\n" | "./${SETUP_SCRIPT}"
 }
 
@@ -188,6 +220,7 @@ main() {
     flock -n 9 || exit 0
   fi
 
+  # Determine RUN_DIR (where setup.log lives)
   local RUN_DIR="/root"
   if [[ -f "${RUN_DIR_FILE}" ]]; then
     RUN_DIR="$(cat "${RUN_DIR_FILE}" | tr -d '\r' | xargs)"
@@ -201,30 +234,40 @@ main() {
 
   exec > >(tee -a "${SETUP_LOG}" "${LOGFILE}") 2>&1
 
-  local stage
-  stage="$(read_stage)"
+  # If snap isn't installed yet, wait until wrapper finishes phase 1
+  if ! snap_is_installed; then
+    say "Domotz snap not installed yet (${DOMOTZ_SNAP}). Waiting for wrapper phase."
+    exit 1
+  fi
 
-  # Normalize older/stale values
-  case "${stage}" in
-    setup_pending) stage="setup" ;;
-    config_pending) stage="config" ;;
-    collector_pending) stage="collector" ;;
-  esac
+  local raw stage
+  raw="$(read_stage)"
+  stage="$(normalize_stage "${raw}")"
 
   # If reboot happened mid-run, advance
   if [[ "${stage}" == "setup_running" ]]; then stage="config"; fi
   if [[ "${stage}" == "config_running" ]]; then stage="collector"; fi
   if [[ "${stage}" == "collector_running" ]]; then stage="collector"; fi
 
-  # Default stage
-  if [[ -z "${stage}" || "${stage}" == "post_snap" ]]; then stage="setup"; fi
-  write_stage "${stage}"
+  # If stage empty/unknown, infer from markers
+  if [[ -z "${stage}" ]]; then
+    stage="$(infer_stage_from_markers)"
+  fi
 
+  # Only accept known stages; otherwise infer
+  case "${stage}" in
+    setup|config|collector|complete) : ;;
+    *) stage="$(infer_stage_from_markers)" ;;
+  esac
+
+  write_stage "${stage}"
   say "Stage: ${stage}"
   say "Run dir: ${RUN_DIR}"
 
   case "${stage}" in
     setup)
+      touch "${MARK_SETUP_STARTED}" || true
+
       do_connects_tun_restart
       cd "${RUN_DIR}"
 
@@ -238,10 +281,14 @@ main() {
       say "RUN: ./${SETUP_SCRIPT} (auto-YES x2)"
       run_setup_auto_yes || true
 
+      # If it returns, mark done and move on
+      touch "${MARK_SETUP_DONE}" || true
       write_stage "config"
       ;;&
 
     config)
+      touch "${MARK_CONFIG_STARTED}" || true
+
       cd "${INTERNAL_DIR}"
       download "${REPO_BASE}/${CONFIG_CHECK_SCRIPT}" "${INTERNAL_DIR}/${CONFIG_CHECK_SCRIPT}"
       chmod +x "${INTERNAL_DIR}/${CONFIG_CHECK_SCRIPT}"
@@ -250,10 +297,13 @@ main() {
       say "RUN: ./${CONFIG_CHECK_SCRIPT}"
       ./"${CONFIG_CHECK_SCRIPT}" || true
 
+      touch "${MARK_CONFIG_DONE}" || true
       write_stage "collector"
       ;;&
 
     collector)
+      touch "${MARK_COLLECTOR_STARTED}" || true
+
       cd "${INTERNAL_DIR}"
       download "${REPO_BASE}/${COLLECTOR_CHECK_SCRIPT}" "${INTERNAL_DIR}/${COLLECTOR_CHECK_SCRIPT}"
       chmod +x "${INTERNAL_DIR}/${COLLECTOR_CHECK_SCRIPT}"
@@ -262,19 +312,16 @@ main() {
       say "RUN: ./${COLLECTOR_CHECK_SCRIPT}"
       ./"${COLLECTOR_CHECK_SCRIPT}" || true
 
+      touch "${MARK_COLLECTOR_DONE}" || true
       write_stage "complete"
+
       say "Complete. Disabling auto-resume service."
       systemctl disable --now solutionz-rmm-resume.service >/dev/null 2>&1 || true
       ;;
 
     complete)
-      say "Already complete."
+      say "Already complete. Disabling auto-resume service."
       systemctl disable --now solutionz-rmm-resume.service >/dev/null 2>&1 || true
-      ;;
-
-    *)
-      say "Unknown stage '${stage}'. Resetting to setup."
-      write_stage "setup"
       ;;
   esac
 }
@@ -332,13 +379,16 @@ main() {
   # Phase 2: install local engine + service that handles reboots automatically
   say "Snap present. Installing local resume engine + service..."
 
-  # Normalize/initialize stage (avoid setup_pending loops)
+  # Stop any older looping service before replacing it
+  sudo systemctl disable --now solutionz-rmm-resume.service >/dev/null 2>&1 || true
+
+  # Initialize stage if missing/empty/legacy
   if [[ -f "${STAGE_FILE}" ]]; then
     s="$(tr -d '\r' < "${STAGE_FILE}" | xargs)"
     case "${s}" in
-      setup_pending|config_pending|collector_pending) : ;;
-      pre_snap) echo "setup" > "${STAGE_FILE}" ;;
-      post_snap|"") echo "setup" > "${STAGE_FILE}" ;;
+      setup_pending|config_pending|collector_pending|post_snap|pre_snap|"") echo "setup" > "${STAGE_FILE}" ;;
+      setup|setup_running|config|config_running|collector|collector_running|complete) : ;;
+      *) echo "setup" > "${STAGE_FILE}" ;;
     esac
   else
     echo "setup" > "${STAGE_FILE}"
@@ -356,5 +406,3 @@ main() {
 }
 
 main "$@"
-
-
