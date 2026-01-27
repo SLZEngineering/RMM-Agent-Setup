@@ -29,15 +29,19 @@ DOMOTZ_IFACES=(
 )
 
 # =========================
-# Run directory behavior (matches your screenshot directory)
+# State / logging
 # =========================
+STATE_DIR="/var/lib/solutionz_rmm"
+STAGE_FILE="${STATE_DIR}/stage"
+RUN_DIR_FILE="${STATE_DIR}/run_dir"
+LOCK_FILE="${STATE_DIR}/lock"
+
+# Keep setup.log in the directory tech ran the command from (matches your screenshot)
 RUN_DIR="${ORIG_PWD:-$PWD}"
 INTERNAL_DIR="${RUN_DIR}/.solutionz_rmm_full_run"
-
-# Logs in the same directory as your screenshot
 SETUP_LOG="${RUN_DIR}/setup.log"
 
-# Also keep a timestamped log copy under /var/log
+# Timestamped log copy under /var/log
 LOGDIR="/var/log/solutionz_rmm"
 TS="$(date +%Y%m%d_%H%M%S)"
 LOGFILE="${LOGDIR}/domotz_full_run_${TS}.log"
@@ -48,9 +52,20 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     export ORIG_PWD="${RUN_DIR}"
-    say "Re-running as root with sudo..."
     exec sudo -E bash "$0" "$@"
   fi
+}
+
+wait_for_snapd() {
+  for _ in {1..45}; do
+    snap version >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 0
+}
+
+snap_is_installed() {
+  snap list "${DOMOTZ_SNAP}" >/dev/null 2>&1
 }
 
 download() {
@@ -66,7 +81,6 @@ download() {
     exit 1
   fi
 
-  # Sanity checks (avoid saving HTML error pages)
   if [[ ! -s "${dest}" ]]; then
     say "ERROR: Downloaded file is empty: ${dest}"
     exit 1
@@ -77,57 +91,225 @@ download() {
   fi
 }
 
+install_resume_service() {
+  # Install a small systemd oneshot service that runs this same script in --resume mode at boot
+  if ! have_cmd systemctl; then
+    say "systemctl not found; cannot enable auto-resume at boot."
+    return 0
+  fi
+
+  local runner="/usr/local/sbin/solutionz_rmm_resume.sh"
+  local unit="/etc/systemd/system/solutionz-rmm-resume.service"
+
+  # Write runner that simply calls this GitHub-managed logic (embedded below) by copying this script content
+  # NOTE: since this file is often streamed via wget|bash, we can't 'cp $0', so we install a standalone runner.
+  cat > "${runner}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# This runner just calls the current wrapper from the repo and runs it in resume mode.
+# If the device has no internet at boot, it will try again next boot.
+URL="https://raw.githubusercontent.com/SLZEngineering/domotz-setup/main/rmm_domotz_full_run_dd_v1.sh"
+if command -v wget >/dev/null 2>&1; then
+  wget -qO- "${URL}" | sudo bash -s -- --resume
+elif command -v curl >/dev/null 2>&1; then
+  curl -fsSL "${URL}" | sudo bash -s -- --resume
+fi
+EOF
+  chmod +x "${runner}"
+
+  cat > "${unit}" <<EOF
+[Unit]
+Description=Solutionz RMM Domotz Resume
+After=network-online.target snapd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${runner}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable solutionz-rmm-resume.service >/dev/null 2>&1 || true
+}
+
+disable_resume_service() {
+  if have_cmd systemctl; then
+    systemctl disable --now solutionz-rmm-resume.service >/dev/null 2>&1 || true
+  fi
+}
+
 run_setup_auto_yes() {
-  # Runs like: sudo ./solutionz_domotz_setup_rev2.sh
-  # (we're already root inside this wrapper)
   printf "yes\nyes\n" | "./${SETUP_SCRIPT}"
 }
 
-install_domotz_prereqs() {
-  say "=== PREP: Ubuntu update + Domotz agent snap + interfaces ==="
+do_connects_tun_restart() {
+  wait_for_snapd
 
-  export DEBIAN_FRONTEND=noninteractive
-
-  # Update apt index
-  say "Running: apt update"
-  apt update
-
-  # Ensure wget/curl exist (wrapper needs one of them)
-  if ! have_cmd wget && ! have_cmd curl; then
-    say "Installing wget + curl (required for downloads)"
-    apt-get install -y wget curl
-  fi
-
-  # Ensure snap is available
-  if ! have_cmd snap; then
-    say "snap not found; installing snapd"
-    apt-get install -y snapd
-  fi
-
-  # Install Domotz agent snap
-  if snap list | awk '{print $1}' | grep -qx "${DOMOTZ_SNAP}"; then
-    say "Domotz snap already installed: ${DOMOTZ_SNAP}"
-  else
-    say "Installing Domotz snap: snap install ${DOMOTZ_SNAP}"
-    snap install "${DOMOTZ_SNAP}"
-  fi
-
-  # Connect Domotz interfaces
   for iface in "${DOMOTZ_IFACES[@]}"; do
-    say "Connecting: snap connect ${DOMOTZ_SNAP}:${iface}"
     snap connect "${DOMOTZ_SNAP}:${iface}" || true
   done
 
-  # Ensure tun is loaded/persistent
-  say "Ensuring 'tun' is present in /etc/modules"
   grep -qxF "tun" /etc/modules 2>/dev/null || echo "tun" >> /etc/modules
-
-  say "Loading tun module: modprobe tun"
   modprobe tun || true
 
-  # Restart Domotz snap
-  say "Restarting Domotz snap: snap restart ${DOMOTZ_SNAP}"
   snap restart "${DOMOTZ_SNAP}" || true
+}
+
+# -------------------------
+# RESUME ENGINE (stage machine)
+# -------------------------
+resume_run() {
+  mkdir -p "${STATE_DIR}" "${LOGDIR}"
+  # Lock so we never run twice (manual + service)
+  exec 9>"${LOCK_FILE}"
+  flock -n 9 || exit 0
+
+  # Determine RUN_DIR for logs/files
+  if [[ -f "${RUN_DIR_FILE}" ]]; then
+    RUN_DIR="$(cat "${RUN_DIR_FILE}")"
+  else
+    echo "${RUN_DIR}" > "${RUN_DIR_FILE}"
+  fi
+
+  INTERNAL_DIR="${RUN_DIR}/.solutionz_rmm_full_run"
+  SETUP_LOG="${RUN_DIR}/setup.log"
+
+  mkdir -p "${INTERNAL_DIR}"
+  touch "${SETUP_LOG}"
+
+  exec > >(tee -a "${SETUP_LOG}" "${LOGFILE}") 2>&1
+
+  local stage=""
+  [[ -f "${STAGE_FILE}" ]] && stage="$(cat "${STAGE_FILE}")"
+
+  # If no stage yet, infer where we are
+  if [[ -z "${stage}" ]]; then
+    if snap_is_installed; then
+      stage="post_snap"
+    else
+      stage="pre_snap"
+    fi
+    echo "${stage}" > "${STAGE_FILE}"
+  fi
+
+  say "Resume stage: ${stage}"
+  say "Run directory: ${RUN_DIR}"
+  say "setup.log: ${SETUP_LOG}"
+
+  # If we crashed/rebooted during a stage, advance as requested:
+  # - setup_inprogress -> run config next
+  # - config_inprogress -> run collector next
+  if [[ "${stage}" == "setup_inprogress" ]]; then
+    stage="config_pending"; echo "${stage}" > "${STAGE_FILE}"
+  elif [[ "${stage}" == "config_inprogress" ]]; then
+    stage="collector_pending"; echo "${stage}" > "${STAGE_FILE}"
+  fi
+
+  case "${stage}" in
+    pre_snap)
+      say "PHASE 1 (Option B): apt update + snap install ONLY, then STOP."
+      export DEBIAN_FRONTEND=noninteractive
+      apt update
+
+      if ! have_cmd wget && ! have_cmd curl; then
+        apt-get install -y wget curl
+      fi
+      if ! have_cmd snap; then
+        apt-get install -y snapd
+      fi
+
+      wait_for_snapd
+
+      if snap_is_installed; then
+        say "Snap already installed."
+        echo "post_snap" > "${STAGE_FILE}"
+        exit 0
+      fi
+
+      say "Installing snap: ${DOMOTZ_SNAP}"
+      snap install "${DOMOTZ_SNAP}" || true
+
+      # Mark that snap stage is done and STOP (tech reruns after reboot)
+      echo "post_snap" > "${STAGE_FILE}"
+      say "PHASE 1 complete. If the device rebooted, that is expected."
+      say "Re-run the same one-liner ONCE after reboot to continue (auto-resume will handle later reboots)."
+      exit 0
+      ;;
+
+    post_snap)
+      # From here on, enable auto-resume for reboots between scripts
+      say "Enabling auto-resume at boot for remaining stages."
+      install_resume_service
+      echo "setup_pending" > "${STAGE_FILE}"
+      stage="setup_pending"
+      ;;&  # fall-through
+
+    setup_pending)
+      say "Connecting snap interfaces + enabling tun + restarting snap..."
+      do_connects_tun_restart
+
+      say "Downloading setup script into run directory..."
+      cd "${RUN_DIR}"
+      download "${RAW_BASE}/${SETUP_SCRIPT}" "${RUN_DIR}/${SETUP_SCRIPT}"
+      chmod +x "${RUN_DIR}/${SETUP_SCRIPT}"
+
+      say "Directory contents (ls):"
+      ls
+
+      # Set in-progress before running so reboot will resume to config
+      echo "setup_inprogress" > "${STAGE_FILE}"
+      say "RUN: ./${SETUP_SCRIPT} (auto-YES x2)"
+      run_setup_auto_yes || true
+
+      # If it returns, advance normally
+      echo "config_pending" > "${STAGE_FILE}"
+      ;;&
+
+    config_pending)
+      say "Downloading + running config check..."
+      mkdir -p "${INTERNAL_DIR}"
+      cd "${INTERNAL_DIR}"
+      download "${RAW_BASE}/${CONFIG_CHECK_SCRIPT}" "${INTERNAL_DIR}/${CONFIG_CHECK_SCRIPT}"
+      chmod +x "${INTERNAL_DIR}/${CONFIG_CHECK_SCRIPT}"
+
+      # Set in-progress before running so reboot will resume to collector
+      echo "config_inprogress" > "${STAGE_FILE}"
+      say "RUN: ./${CONFIG_CHECK_SCRIPT}"
+      ./"${CONFIG_CHECK_SCRIPT}" || true
+
+      # If it returns, advance normally
+      echo "collector_pending" > "${STAGE_FILE}"
+      ;;&
+
+    collector_pending)
+      say "Downloading + running collector connection check..."
+      mkdir -p "${INTERNAL_DIR}"
+      cd "${INTERNAL_DIR}"
+      download "${RAW_BASE}/${COLLECTOR_CHECK_SCRIPT}" "${INTERNAL_DIR}/${COLLECTOR_CHECK_SCRIPT}"
+      chmod +x "${INTERNAL_DIR}/${COLLECTOR_CHECK_SCRIPT}"
+
+      echo "collector_inprogress" > "${STAGE_FILE}"
+      say "RUN: ./${COLLECTOR_CHECK_SCRIPT}"
+      ./"${COLLECTOR_CHECK_SCRIPT}" || true
+
+      echo "complete" > "${STAGE_FILE}"
+      say "All stages complete. Disabling auto-resume service."
+      disable_resume_service
+      ;;
+
+    complete)
+      say "Already complete. Nothing to do."
+      disable_resume_service
+      ;;
+
+    *)
+      say "Unknown stage '${stage}'. Resetting to post_snap."
+      echo "post_snap" > "${STAGE_FILE}"
+      ;;
+  esac
 }
 
 # -------------------------
@@ -135,55 +317,11 @@ install_domotz_prereqs() {
 # -------------------------
 need_root "$@"
 
-mkdir -p "${INTERNAL_DIR}" "${LOGDIR}"
-touch "${SETUP_LOG}"
+# If called by resume service, we'll run resume mode directly
+if [[ "${1:-}" == "--resume" ]]; then
+  resume_run
+  exit 0
+fi
 
-# Log to BOTH: setup.log in RUN_DIR AND a timestamped /var/log copy
-exec > >(tee -a "${SETUP_LOG}" "${LOGFILE}") 2>&1
-
-say "Starting Domotz full automation run"
-say "Run directory: ${RUN_DIR}"
-say "Internal dir:  ${INTERNAL_DIR}"
-say "setup.log:     ${SETUP_LOG}"
-say "full log copy: ${LOGFILE}"
-
-cd "${RUN_DIR}"
-
-# PREP SECTION (apt update + domotz snap install/connect + tun + restart)
-install_domotz_prereqs
-
-# Download setup script into RUN_DIR (so ls matches your screenshot)
-say "Downloading ${SETUP_SCRIPT} into ${RUN_DIR}..."
-download "${RAW_BASE}/${SETUP_SCRIPT}" "${RUN_DIR}/${SETUP_SCRIPT}"
-
-# Download other scripts into hidden INTERNAL_DIR (keeps ls clean)
-say "Downloading ${CONFIG_CHECK_SCRIPT} into ${INTERNAL_DIR}..."
-download "${RAW_BASE}/${CONFIG_CHECK_SCRIPT}" "${INTERNAL_DIR}/${CONFIG_CHECK_SCRIPT}"
-
-say "Downloading ${COLLECTOR_CHECK_SCRIPT} into ${INTERNAL_DIR}..."
-download "${RAW_BASE}/${COLLECTOR_CHECK_SCRIPT}" "${INTERNAL_DIR}/${COLLECTOR_CHECK_SCRIPT}"
-
-# Verify downloads (your doc's 'ls' step)
-say "Directory contents (ls):"
-ls
-
-# chmod +x (your Step 3)
-chmod +x "${RUN_DIR}/${SETUP_SCRIPT}"
-chmod +x "${INTERNAL_DIR}/${CONFIG_CHECK_SCRIPT}" "${INTERNAL_DIR}/${COLLECTOR_CHECK_SCRIPT}"
-
-# Run setup script with ./ (your Step 4 style)
-say "=== RUN 1/3: sudo ./${SETUP_SCRIPT} (auto-YES x2) ==="
-run_setup_auto_yes
-
-# Run config check
-say "=== RUN 2/3: ${CONFIG_CHECK_SCRIPT} ==="
-cd "${INTERNAL_DIR}"
-./"${CONFIG_CHECK_SCRIPT}"
-
-# Run collector connection check
-say "=== RUN 3/3: ${COLLECTOR_CHECK_SCRIPT} ==="
-./"${COLLECTOR_CHECK_SCRIPT}"
-
-say "DONE."
-say "setup.log is in: ${SETUP_LOG}"
-say "additional timestamped log is in: ${LOGFILE}"
+# Normal manual start: run resume engine once
+resume_run
