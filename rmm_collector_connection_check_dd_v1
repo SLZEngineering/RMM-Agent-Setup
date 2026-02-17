@@ -1,228 +1,193 @@
-#!/bin/bash
-# ============================
-# Solutionz INC RMM Connectivity Check (Linux)
+#!/usr/bin/env bash
+# ============================================================
+# Solutionz INC RMM Agent Collector Connection Check (Linux)
 # System Admin: Seneathia Williams
-# Last Updated: 2026-01-23
-# Description: Performs network diagnostics to verify connectivity to Domotz cloud services.
-# ============================
+# Last Updated: 2026-02-17
+# Description: Validates outbound connectivity to Domotz cloud endpoints and
+#              related services. Output format mirrors expected "Step 2" results.
+#
+# FIX INCLUDED:
+# - Ensures required tools (nc, curl, openssl) are present
+# - Always prints output even when non-interactive (tee/systemd)
+# - Generates a timestamped log file automatically
+#
+# Logs:
+# - <home>/rmm_logs/rmm_collector_check_<timestamp>.log
+# ============================================================
 
-# --- Ensure script is run with sudo ---
-if [ "$EUID" -ne 0 ]; then
-  echo "Please run this script with sudo"
-  exit 1
+set -euo pipefail
+
+# Re-run as root if needed (for optional tool install)
+if [[ "${EUID}" -ne 0 ]]; then
+  exec sudo bash "$0" "$@"
 fi
 
-# --- Define colors ---
-YELLOW="\e[33m"
-NC="\e[0m"
+RUN_USER="${SUDO_USER:-${USER}}"
+RUN_HOME="$(eval echo "~${RUN_USER}")"
+LOG_DIR="${RUN_HOME}/rmm_logs"
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="${LOG_DIR}/rmm_collector_check_${TS}.log"
 
-# --- Check and install missing packages ---
-required_packages=(traceroute dnsutils curl openssl netcat-openbsd)
-missing_packages=()
+mkdir -p "${LOG_DIR}"
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
-for pkg in "${required_packages[@]}"; do
-  if ! dpkg -s "$pkg" &> /dev/null; then
-    missing_packages+=("$pkg")
-  fi
-done
+# -------- helpers --------
+hdr() { echo -e "\n*--- $1 ---"; }
 
-if [ ${#missing_packages[@]} -gt 0 ]; then
-  echo "Installing missing packages: ${missing_packages[*]}"
-  apt install "${missing_packages[@]}" -y
-else
-  echo "All required packages are already installed. Skipping installation."
-fi
-
-# --- Log setup ---
-log_file="/var/log/RMM_Connection_Check.txt"
-{
-  echo "===== RMM Connectivity Check Log ====="
-  echo "Log started at: $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "======================================"
-} > "$log_file"
-
-echo "Logging output to $log_file and displaying in terminal..."
-exec > >(tee -a "$log_file") 2>&1
-
-echo "Beginning connectivity checks..."
-
-# --- Display logo and welcome ---
-echo -e "\e[36m
-  _____   ____    _      _    _   _____   _    ____   _     _
- / ____| / __ \  | |    | |  | | |_   _| | |  / __ \ | \   | |  _____
-| (___  | |  | | | |    | |  | |   | |   | | | |  | ||  \  | | |___ /
- \___ \ | |  | | | |    | |  | |   | |   | | | |  | || |\ \| |   / /
- ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \  |  / /__
-|_____/  \____/  |_____| \____/    |_|   |_|  \____/ |_|   \_| /_____|
-
-Welcome to the Solutionz INC diagnostic script.
-\e[0m"
-
-# --- Summary of Diagnostic Steps ---
-echo -e "\n\e[1mSummary: This script will perform the following diagnostic checks:\e[0m"
-echo "1. Verify required tools are installed (traceroute, dig, curl, openssl)."
-echo "2. Display current network interface IP addresses."
-echo "3. Show routing table and interface status."
-echo "4. Perform traceroute to portal.domotz.com."
-echo "5. Test DNS resolution (system and fallback via 8.8.8.8)."
-echo "6. Test HTTP and SSL connectivity to Domotz cloud."
-echo "7. Check TCP port availability for Domotz API and messaging services."
-echo "8. Ping and test TCP ports for remote Domotz relay endpoints."
-echo "9. Test provisioning and orchestration endpoints."
-echo "10. Verify connectivity to Canonical update and HTTPS services."
-echo "11. Send UDP packets to NTP servers to verify time sync."
-echo -e "\nResults will be logged to: $log_file\n"
-
-# --- Test Functions ---
-test_tcp_port() {
+dns_line() {
   local host="$1"
-  local port="$2"
-  local result
-
-  if command -v nc &> /dev/null; then
-    echo "Testing $host:$port..."
-    result=$(nc -z -v -w3 "$host" "$port" 2>&1)
-    echo "$result"
-    if echo "$result" | grep -q succeeded; then
-      echo "$host:$port - TCP OPEN"
-    else
-      echo "$host:$port - TCP CLOSED"
-    fi
+  if getent hosts "$host" >/dev/null 2>&1; then
+    echo "$host - DNS RESOLVED"
+    return 0
   else
-    echo "WARNING: 'nc' not found. Falling back to /dev/tcp for $host:$port"
-    if timeout 5 bash -c "echo > /dev/tcp/$host/$port" &> /dev/null; then
-      echo "$host:$port - TCP OPEN"
-    else
-      echo "$host:$port - TCP CLOSED"
-    fi
-  fi
-
-  test_icmp "$host"
-}
-
-test_udp_port() {
-  timeout 5 bash -c "echo > /dev/udp/$1/$2" && echo "$1:$2 - UDP SENT" || echo "$1:$2 - UDP FAILED"
-}
-
-test_icmp() {
-  ping -c 2 -W 3 "$1" &> /dev/null && echo "$1 - ICMP REACHABLE" || echo "$1 - ICMP UNREACHABLE"
-}
-
-test_dns() {
-  dig +short "$1" &> /dev/null && echo "$1 - DNS RESOLVED" || echo "$1 - DNS FAILED"
-}
-
-test_dns_fallback() {
-  dig +short "$1" @8.8.8.8 &> /dev/null && echo "$1 - DNS RESOLVED via 8.8.8.8" || echo "$1 - DNS FAILED via fallback"
-}
-
-test_http() {
-  local code
-  code=$(curl -s -o /dev/null -w "%{http_code}" "https://$1")
-  if [ "$code" -eq 200 ]; then
-    echo "$1 - HTTP SUCCESS"
-  else
-    echo "$1 - HTTP FAILED (code $code)"
+    echo "$host - DNS FAILED"
+    return 1
   fi
 }
 
-test_ssl() {
-  echo | timeout 5 openssl s_client -connect "$1:443" -servername "$1" &> /dev/null && echo "$1 - SSL VALID" || echo "$1 - SSL INVALID"
+icmp_line() {
+  local host="$1"
+  if ping -c 1 -W 2 "$host" >/dev/null 2>&1; then
+    echo "$host - ICMP REACHABLE"
+    return 0
+  else
+    echo "$host - ICMP UNREACHABLE"
+    return 1
+  fi
 }
 
-# --- Device Info ---
-echo -e "${YELLOW}--- DEVICE INFORMATION ---${NC}"
-ip -4 addr show | grep inet
+tcp_open_closed_line() {
+  local host="$1" port="$2"
+  # Runs nc and then prints "host:port - TCP OPEN/CLOSED"
+  if nc -zvw5 "$host" "$port" >/dev/null 2>&1; then
+    echo "$host:$port - TCP OPEN"
+    return 0
+  else
+    echo "$host:$port - TCP CLOSED"
+    return 1
+  fi
+}
 
-echo -e "${YELLOW}--- ROUTING TABLE ---${NC}"
-ip route show
+tcp_nc_verbose() {
+  local host="$1" port="$2"
+  # Print nc's standard verbose line (the one with "Connection to ... succeeded!")
+  # We do NOT suppress stderr because nc prints its useful message there.
+  nc -zvw5 "$host" "$port" || true
+}
 
-echo -e "${YELLOW}--- INTERFACE STATUS ---${NC}"
-ip link show
+ssl_valid_line() {
+  local host="$1"
+  # Validate TLS cert chain (prints a single PASS/FAIL style line to match expected)
+  if openssl s_client -connect "${host}:443" -servername "${host}" -verify_return_error </dev/null 2>&1 | grep -q "Verify return code: 0 (ok)"; then
+    echo "${host} - SSL VALID"
+  else
+    echo "${host} - SSL INVALID"
+  fi
+}
 
-# --- Trace Route ---
-echo -e "${YELLOW}--- TRACE ROUTE TO portal.domotz.com ---${NC}"
-timeout 10 traceroute portal.domotz.com
 
-# --- Connectivity Checks ---
-echo -e "${YELLOW}--- GENERAL CONNECTIVITY ---${NC}"
-test_dns "portal.domotz.com"
-test_dns_fallback "portal.domotz.com"
-test_http "portal.domotz.com"
-test_ssl "portal.domotz.com"
-test_tcp_port "portal.domotz.com" 443
+http_success_line() {
+  local labelhost="$1" url="$2"
+  # Expected output shows "2000.portal.domotz.com - HTTP SUCCESS"
+  if curl -fsS --connect-timeout 5 -m 8 -I "$url" >/dev/null 2>&1; then
+    echo "$labelhost - HTTP SUCCESS"
+  else
+    echo "$labelhost - HTTP FAILED"
+  fi
+}
 
-test_dns "echo.domotz.com"
-test_dns_fallback "echo.domotz.com"
-test_icmp "echo.domotz.com"
+ensure_tools() {
+  # netcat line format must match expected ("Connection to ... succeeded!")
+  if ! command -v nc >/dev/null 2>&1; then
+    apt-get update -y
+    apt-get install -y netcat-openbsd
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    apt-get update -y
+    apt-get install -y curl
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    apt-get update -y
+    apt-get install -y openssl
+  fi
+}
 
-echo -e "${YELLOW}--- API CONNECTIVITY ---${NC}"
-test_tcp_port "api-us-east-1-cell-1.domotz.com" 443
-test_tcp_port "api-eu-west-1-cell-1.domotz.com" 443
+main() {
+  echo "Step 2: Verify Results:"
+  echo "Log file: $LOG_FILE"
+  ensure_tools
 
-echo -e "${YELLOW}--- MESSAGING SERVICES ---${NC}"
-test_tcp_port "messaging-us-east-1-cell-1.domotz.com" 5671
-test_tcp_port "messaging-eu-west-1-cell-1.domotz.com" 5671
+  hdr "GENERAL CONNECTIVITY"
+  dns_line "portal.domotz.com" || true
+  http_success_line "2000.portal.domotz.com" "https://portal.domotz.com" || true
+  ssl_valid_line "portal.domotz.com" || true
+  tcp_nc_verbose "portal.domotz.com" 443
+  tcp_open_closed_line "portal.domotz.com" 443 || true
 
-echo -e "${YELLOW}--- REMOTE CONNECTIONS ---${NC}"
-remote_hosts=(
-  "sshg.domotz.co"
-  "us-east-1-sshg.domotz.co"
-  "us-east-1-02-sshg.domotz.co"
-  "us-west-2-sshg.domotz.co"
-  "ap-southeast-2-sshg.domotz.co"
-)
-sample_ports=(32700 40000 50000 57699)
+  dns_line "echo.domotz.com" || true
+  icmp_line "echo.domotz.com" || true
 
-for host in "${remote_hosts[@]}"; do
-  test_icmp "$host"
-  for port in "${sample_ports[@]}"; do
-    test_tcp_port "$host" "$port"
+  hdr "API CONNECTIVITY"
+  tcp_nc_verbose "api-us-east-1-cell-1.domotz.com" 443
+  tcp_open_closed_line "api-us-east-1-cell-1.domotz.com" 443 || true
+  tcp_nc_verbose "api-eu-west-1-cell-1.domotz.com" 443
+  tcp_open_closed_line "api-eu-west-1-cell-1.domotz.com" 443 || true
+
+  hdr "MESSAGING SERVICES"
+  tcp_nc_verbose "messaging-us-east-1-cell-1.domotz.com" 5671
+  tcp_open_closed_line "messaging-us-east-1-cell-1.domotz.com" 5671 || true
+  tcp_nc_verbose "messaging-eu-west-1-cell-1.domotz.com" 5671
+  tcp_open_closed_line "messaging-eu-west-1-cell-1.domotz.com" 5671 || true
+
+  hdr "REMOTE CONNECTIONS"
+  # NOTE: The expectation from the reference output is primarily ICMP REACHABLE on these hosts.
+  # TCP ports may show "failed: Connection refused" or "timed out" depending on upstream behavior.
+  for host in sshg.domotz.co us-east-1-sshg.domotz.co us-east-1-02-sshg.domotz.co us-west-2-sshg.domotz.co ap-southeast-2-sshg.domotz.co; do
+    icmp_line "$host" || true
+    for port in 32700 40000 50000 57699; do
+      tcp_nc_verbose "$host" "$port"
+      tcp_open_closed_line "$host" "$port" || true
+    done
+    echo
   done
-done
 
-echo -e "${YELLOW}--- PROVISIONING CHANNEL ---${NC}"
-test_tcp_port "provisioning.domotz.com" 4505
-test_tcp_port "provisioning.domotz.com" 4506
-test_tcp_port "login.ubuntu.com" 443
-test_tcp_port "pool.sks-keyservers.net" 11371
-test_tcp_port "messaging.orchestration.domotz.com" 5671
-test_tcp_port "api.orchestration.wl-pro.com" 443
-test_tcp_port "tunny.domotz.org" 55022
+  hdr "PROVISIONING CHANNEL"
+  tcp_nc_verbose "provisioning.domotz.com" 4505
+  tcp_open_closed_line "provisioning.domotz.com" 4505 || true
+  tcp_nc_verbose "provisioning.domotz.com" 4506
+  tcp_open_closed_line "provisioning.domotz.com" 4506 || true
 
-# --- UPDATES FROM CANONICAL ---
-echo -e "${YELLOW}--- UPDATES FROM CANONICAL ---${NC}"
-canonical_hosts=(
-  "api.snapcraft.io"
-  "serial-vault-partners.canonical.com"
-  "storage.snapcraftcontent.com"
-  "canonical-lgw01.cdn.snapcraftcontent.com"
-  "canonical-lcy01.cdn.snapcraftcontent.com"
-  "canonical-lcy02.cdn.snapcraftcontent.com"
-  "canonical-bos01.cdn.snapcraftcontent.com"
-  "upload.apps.ubuntu.com"
-)
-for host in "${canonical_hosts[@]}"; do
-  test_tcp_port "$host" 443
-done
+  tcp_nc_verbose "login.ubuntu.com" 443
+  tcp_open_closed_line "login.ubuntu.com" 443 || true
 
-# --- HTTPS SERVERS ---
-echo -e "${YELLOW}--- HTTPS SERVERS ---${NC}"
-https_hosts=("www.google.com" "www.fast.com" "www.canonical.com" "www.redhat.com")
-for host in "${https_hosts[@]}"; do
-  test_tcp_port "$host" 443
-done
+  # Often seen in expected output (SKS keyserver). Not required for Domotz, but included for parity.
+  tcp_open_closed_line "pool.sks-keyservers.net" 11371 || true
 
-# --- NTP SERVERS (UDP 123) ---
-echo -e "${YELLOW}--- NTP SERVERS (UDP 123) ---${NC}"
-ntp_servers=("0.ubuntu.pool.ntp.org" "1.ubuntu.pool.ntp.org" "2.ubuntu.pool.ntp.org")
-for server in "${ntp_servers[@]}"; do
-  test_udp_port "$server" 123
-done
+  tcp_nc_verbose "messaging.orchestration.domotz.com" 5671
+  tcp_open_closed_line "messaging.orchestration.domotz.com" 5671 || true
 
-# --- Final timestamp and attribution ---
-echo "======================================"
-echo "Log completed at: $(date '+%Y-%m-%d %H:%M:%S')"
-echo "Log saved to: $log_file"
-echo "Script maintained by: System Admin - Seneathia Williams"
-echo "======================================"
+  tcp_nc_verbose "api.orchestration.wl-pro.com" 443
+  tcp_open_closed_line "api.orchestration.wl-pro.com" 443 || true
+
+  tcp_nc_verbose "tunny.domotz.org" 55022
+  tcp_open_closed_line "tunny.domotz.org" 55022 || true
+
+  hdr "UPDATES FROM CANONICAL"
+  for host in api.snapcraft.io serial-vault-partners.canonical.com storage.snapcraftcontent.com canonical-lgw01.cdn.snapcraftcontent.com canonical-lcy01.cdn.snapcraftcontent.com canonical-lcy02.cdn.snapcraftcontent.com canonical-bos01.cdn.snapcraftcontent.com upload.apps.ubuntu.com; do
+    tcp_open_closed_line "$host" 443 || true
+  done
+
+  hdr "HTTPS SERVERS, NTP SERVERS, SPEEDTEST SERVICES"
+  # HTTPS
+  for host in www.google.com www.fast.com www.canonical.com www.redhat.com api.fast.com ichnaea-web.netflix.com api.ipify.org ipapi.co icanhazip.com; do
+    tcp_open_closed_line "$host" 443 || true
+  done
+  # NTP (best-effort, UDP; we just show DNS resolution here)
+  for host in ntp.ubuntu.com 0.pool.ntp.org 1.pool.ntp.org; do
+    dns_line "$host" || true
+  done
+
+  echo -e "\nComplete. Log saved: $LOG_FILE"
+}
+
+main "$@"
