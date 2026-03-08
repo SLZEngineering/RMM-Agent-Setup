@@ -1,239 +1,229 @@
+#!/bin/bash
 # ============================
-# Solutionz INC RMM Connectivity Check
+# Solutionz INC RMM Connection Check (Linux)
+# System Admin: Seneathia Williams
+# Last Updated: 2026-03-08
+# Description: Performs Connection Diagnostics to Confirm RMM Agents Connectivity Access
 # ============================
 
-param([switch]$Silent)
+# --- Ensure script is run with sudo ---
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run this script with sudo"
+  exit 1
+fi
 
-# --- Display logo and welcome (excluded from transcript) ---
-$logo = @'
-  _____   ____    _      _    _   _____   _    ____   __     __
- / ____| / __ \  | |    | |  | | |_   _| | |  / __ \ |  \   |  |  ______
-| (___  | |  | | | |    | |  | |   | |   | | | |  | ||   \  |  | |___  /
- \___ \ | |  | | | |    | |  | |   | |   | | | |  | ||  |\ \|  |    / /
- ____) || |__| | | |___ | |__| |   | |   | | | |__| ||  | \    |  / /__
-|_____/  \____/  |_____| \____/    |_|   |_|  \____/ |__|   \__| /_____|
+# --- Define colors ---
+YELLOW="\e[33m"
+NC="\e[0m"
+
+# --- Check and install missing packages ---
+required_packages=(traceroute dnsutils curl openssl netcat-openbsd iputils-ping)
+missing_packages=()
+
+for pkg in "${required_packages[@]}"; do
+  if ! dpkg -s "$pkg" &> /dev/null; then
+    missing_packages+=("$pkg")
+  fi
+done
+
+if [ ${#missing_packages[@]} -gt 0 ]; then
+  echo "Installing missing packages: ${missing_packages[*]}"
+  apt install "${missing_packages[@]}" -y
+else
+  echo "All required packages are already installed. Skipping installation."
+fi
+
+# --- Log setup ---
+log_file="/var/log/RMM_Connection_Check.txt"
+{
+  echo "===== RMM Connectivity Check Log ====="
+  echo "Log started at: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "======================================"
+} > "$log_file"
+
+echo "Logging output to $log_file and displaying in terminal..."
+exec > >(tee -a "$log_file") 2>&1
+
+echo "Beginning connectivity checks..."
+
+# --- Display logo and welcome ---
+echo -e "\e[36m
+  _____   ____    _      _    _   _____   _    ____   _     _
+ / ____| / __ \  | |    | |  | | |_   _| | |  / __ \ | \   | |  _____
+| (___  | |  | | | |    | |  | |   | |   | | | |  | ||  \  | | |___ /
+ \___ \ | |  | | | |    | |  | |   | |   | | | |  | || |\ \| |   / /
+ ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \  |  / /__
+|_____/  \____/  |_____| \____/    |_|   |_|  \____/ |_|   \_| /_____|
 
 Welcome to the Solutionz INC diagnostic script.
-'@
-Write-Host $logo -ForegroundColor Cyan
+\e[0m"
 
-Write-Host "`n======================================================================"
-Write-Host "Solutionz INC is now checking RMM connections. Please wait a moment..."
-Write-Host "========================================================================`n"
-
-# --- Define file paths ---
-$downloads = Join-Path $env:USERPROFILE "Downloads"
-$logFile = Join-Path $downloads "RMM_Connectivity_Log.txt"
-$zipPath = Join-Path $downloads "RMM_Connectivity_Report.zip"
-$logCopyPath = Join-Path $downloads "RMM_Connectivity_Log.txt"
-
-# --- CONFIGURATION ---
-$Silent = $true
-$downloads = Join-Path $env:USERPROFILE "Downloads"
-$logFile = Join-Path $downloads "RMM_Connectivity_Log.txt"
-$zipPath = Join-Path $downloads "RMM_Connectivity_Report.zip"
-$logCopyPath = Join-Path $downloads "RMM_Connectivity_Log.txt"
-
-# --- Start transcript ---
-$transcriptStarted = $false
-try {
-    Start-Transcript -Path $logFile
-    $transcriptStarted = $true
-} catch {}
-
-# --- Progress Bar Function ---
-function Show-ProgressBar {
-    param([int]$PercentComplete)
-    Write-Progress -Activity "Checking RMM Connections" -Status "$PercentComplete% Complete" -PercentComplete $PercentComplete
-}
+# --- Summary of Diagnostic Steps ---
+echo -e "\n\e[1mSummary: This script will perform the following diagnostic checks:\e[0m"
+echo "1. Verify required tools are installed (traceroute, dig, curl, openssl)."
+echo "2. Display current network interface IP addresses."
+echo "3. Show routing table and interface status."
+echo "4. Perform traceroute to portal.domotz.com."
+echo "5. Test DNS resolution (system and fallback via 8.8.8.8)."
+echo "6. Test HTTP and SSL connectivity to Domotz cloud."
+echo "7. Check TCP port availability for Domotz API and messaging services."
+echo "8. Ping and test TCP ports for remote Domotz relay endpoints."
+echo "9. Test provisioning and orchestration endpoints."
+echo "10. Verify connectivity to Canonical update and HTTPS services."
+echo "11. Send UDP packets to NTP servers to verify time sync."
+echo -e "\nResults will be logged to: $log_file\n"
 
 # --- Test Functions ---
-function Test-TCPPort {
-    param ([string]$TargetHost, [int]$Port)
-    try {
-        $tcpClient = New-Object System.Net.Sockets.TcpClient
-        $tcpClient.Connect($TargetHost, $Port)
-        $tcpClient.Close()
-        Write-Host "${TargetHost}:${Port} - TCP OPEN"
-    } catch {
-        Write-Host "${TargetHost}:${Port} - TCP CLOSED"
-    }
+test_tcp_port() {
+  local host="$1"
+  local port="$2"
+  local result
+
+  if command -v nc &> /dev/null; then
+    echo "Testing $host:$port..."
+    result=$(nc -z -v -w3 "$host" "$port" 2>&1)
+    echo "$result"
+    if echo "$result" | grep -q succeeded; then
+      echo "$host:$port - TCP OPEN"
+    else
+      echo "$host:$port - TCP CLOSED"
+    fi
+  else
+    echo "WARNING: 'nc' not found. Falling back to /dev/tcp for $host:$port"
+    if timeout 5 bash -c "echo > /dev/tcp/$host/$port" &> /dev/null; then
+      echo "$host:$port - TCP OPEN"
+    else
+      echo "$host:$port - TCP CLOSED"
+    fi
+  fi
 }
 
-function Test-UDPPort {
-    param ([string]$TargetHost, [int]$Port)
-    try {
-        $udpClient = New-Object System.Net.Sockets.UdpClient
-        $udpClient.Connect($TargetHost, $Port)
-        $udpClient.Close()
-        Write-Host "${TargetHost}:${Port} - UDP SENT (no response expected)"
-    } catch {
-        Write-Host "${TargetHost}:${Port} - UDP FAILED"
-    }
+test_udp_port() {
+  timeout 5 bash -c "echo > /dev/udp/$1/$2" && echo "$1:$2 - UDP SENT" || echo "$1:$2 - UDP FAILED"
 }
 
-function Test-ICMP {
-    param ([string]$TargetHost)
-    if (Test-Connection -ComputerName $TargetHost -Count 2 -Quiet) {
-        Write-Host "$TargetHost - ICMP REACHABLE"
-    } else {
-        Write-Host "$TargetHost - ICMP UNREACHABLE"
-    }
+test_icmp() {
+  if ! command -v ping &> /dev/null; then
+    echo "$1 - ICMP SKIPPED (ping not installed; install iputils-ping)"
+    return
+  fi
+  ping -c 2 -W 3 "$1" &> /dev/null && echo "$1 - ICMP REACHABLE" || echo "$1 - ICMP UNREACHABLE"
 }
 
-function Test-DNS {
-    param ([string]$TargetHost)
-    try {
-        $dns = Resolve-DnsName -Name $TargetHost -ErrorAction Stop
-        Write-Host "$TargetHost - DNS RESOLVED to $($dns[0].IPAddress)"
-    } catch {
-        Write-Host "$TargetHost - DNS RESOLUTION FAILED"
-    }
+test_dns() {
+  dig +short "$1" &> /dev/null && echo "$1 - DNS RESOLVED" || echo "$1 - DNS FAILED"
 }
 
-function Test-HTTP {
-    param ([string]$TargetHost)
-    try {
-        $response = Invoke-WebRequest -Uri "https://$TargetHost" -UseBasicParsing -TimeoutSec 5
-        Write-Host "$TargetHost - HTTP RESPONSE: $($response.StatusCode)"
-    } catch {
-        Write-Host "$TargetHost - HTTP FAILED"
-    }
+test_dns_fallback() {
+  dig +short "$1" @8.8.8.8 &> /dev/null && echo "$1 - DNS RESOLVED via 8.8.8.8" || echo "$1 - DNS FAILED via fallback"
 }
 
-function Test-SSL {
-    param ([string]$TargetHost)
-    try {
-        $tcpClient = New-Object System.Net.Sockets.TcpClient($TargetHost, 443)
-        $sslStream = New-Object System.Net.Security.SslStream($tcpClient.GetStream(), $false, ({ $true }))
-        $sslStream.AuthenticateAsClient($TargetHost)
-        $cert = $sslStream.RemoteCertificate
-        Write-Host "$TargetHost - SSL CERT VALID"
-        $tcpClient.Close()
-    } catch {
-        Write-Host "$TargetHost - SSL CERT INVALID"
-    }
+test_http() {
+  local code
+  code=$(curl -s -o /dev/null -w "%{http_code}" "https://$1")
+  if [ "$code" -eq 200 ]; then
+    echo "$1 - HTTP SUCCESS"
+  else
+    echo "$1 - HTTP FAILED (code $code)"
+  fi
 }
 
-# --- DEVICE INFORMATION ---
-Write-Host "`n--- DEVICE INFORMATION ---"
-Get-NetIPAddress | Where-Object { $_.AddressFamily -eq 'IPv4' -and $_.IPAddress -notlike '169.*' } | ForEach-Object {
-    Write-Host "Interface: $($_.InterfaceAlias) - IP Address: $($_.IPAddress)"
+test_ssl() {
+  echo | timeout 5 openssl s_client -connect "$1:443" -servername "$1" &> /dev/null && echo "$1 - SSL VALID" || echo "$1 - SSL INVALID"
 }
 
-# --- TRACE ROUTE ---
-Write-Host "`n--- TRACE ROUTE TO portal.domotz.com ---"
-$trace = Test-NetConnection -ComputerName "portal.domotz.com" -TraceRoute
-$trace.TraceRoute | ForEach-Object { Write-Host $_ }
+# --- Device Info ---
+echo -e "${YELLOW}--- DEVICE INFORMATION ---${NC}"
+ip -4 addr show | grep inet
+
+echo -e "${YELLOW}--- ROUTING TABLE ---${NC}"
+ip route show
+
+echo -e "${YELLOW}--- INTERFACE STATUS ---${NC}"
+ip link show
+
+# --- Trace Route ---
+echo -e "${YELLOW}--- TRACE ROUTE TO portal.domotz.com ---${NC}"
+timeout 10 traceroute portal.domotz.com
 
 # --- Connectivity Checks ---
-Write-Host "`n--- GENERAL CONNECTIVITY ---"
-Test-DNS -TargetHost "portal.domotz.com"
-Test-HTTP -TargetHost "portal.domotz.com"
-Test-SSL -TargetHost "portal.domotz.com"
-Test-TCPPort -TargetHost "portal.domotz.com" -Port 443
+echo -e "${YELLOW}--- GENERAL CONNECTIVITY ---${NC}"
+test_dns "portal.domotz.com"
+test_dns_fallback "portal.domotz.com"
+test_http "portal.domotz.com"
+test_ssl "portal.domotz.com"
+test_tcp_port "portal.domotz.com" 443
 
-Test-DNS -TargetHost "echo.domotz.com"
-Test-ICMP -TargetHost "echo.domotz.com"
+test_dns "echo.domotz.com"
+test_dns_fallback "echo.domotz.com"
+test_icmp "echo.domotz.com"
 
-Write-Host "`n--- API CONNECTIVITY ---"
-Test-TCPPort -TargetHost "api-us-east-1-cell-1.domotz.com" -Port 443
-Test-TCPPort -TargetHost "api-eu-west-1-cell-1.domotz.com" -Port 443
+echo -e "${YELLOW}--- API CONNECTIVITY ---${NC}"
+test_tcp_port "api-us-east-1-cell-1.domotz.com" 443
+test_tcp_port "api-eu-west-1-cell-1.domotz.com" 443
 
-Write-Host "`n--- MESSAGING SERVICES ---"
-Test-TCPPort -TargetHost "messaging-us-east-1-cell-1.domotz.com" -Port 5671
-Test-TCPPort -TargetHost "messaging-eu-west-1-cell-1.domotz.com" -Port 5671
+echo -e "${YELLOW}--- MESSAGING SERVICES ---${NC}"
+test_tcp_port "messaging-us-east-1-cell-1.domotz.com" 5671
+test_tcp_port "messaging-eu-west-1-cell-1.domotz.com" 5671
 
-Write-Host "`n--- REMOTE CONNECTIONS ---"
-$remoteHosts = @(
-    "sshg.domotz.co",
-    "us-east-1-sshg.domotz.co",
-    "us-east-1-02-sshg.domotz.co",
-    "us-west-2-sshg.domotz.co",
-    "ap-southeast-2-sshg.domotz.co"
+echo -e "${YELLOW}--- REMOTE CONNECTIONS ---${NC}"
+remote_hosts=(
+  "sshg.domotz.co"
+  "us-east-1-sshg.domotz.co"
+  "us-east-1-02-sshg.domotz.co"
+  "us-west-2-sshg.domotz.co"
+  "ap-southeast-2-sshg.domotz.co"
 )
-$samplePorts = @(32700, 40000, 50000, 57699)
+sample_ports=(32700 40000 50000 57699)
 
-$totalSteps = $remoteHosts.Count * ($samplePorts.Count + 1)
-$currentStep = 0
+for host in "${remote_hosts[@]}"; do
+  for port in "${sample_ports[@]}"; do
+    test_tcp_port "$host" "$port"
+  done
+done
 
-foreach ($TargetHost in $remoteHosts) {
-    $currentStep++
-    $percent = [math]::Round(($currentStep / $totalSteps) * 100)
-    Show-ProgressBar -PercentComplete $percent
-    Test-ICMP -TargetHost $TargetHost
+echo -e "${YELLOW}--- PROVISIONING CHANNEL ---${NC}"
+test_tcp_port "provisioning.domotz.com" 4505
+test_tcp_port "provisioning.domotz.com" 4506
+test_tcp_port "login.ubuntu.com" 443
+test_tcp_port "pool.sks-keyservers.net" 11371
+test_tcp_port "messaging.orchestration.domotz.com" 5671
+test_tcp_port "api.orchestration.wl-pro.com" 443
+test_tcp_port "tunny.domotz.org" 55022
 
-    foreach ($Port in $samplePorts) {
-        $currentStep++
-        $percent = [math]::Round(($currentStep / $totalSteps) * 100)
-        Show-ProgressBar -PercentComplete $percent
-        Test-TCPPort -TargetHost $TargetHost -Port $Port
-    }
-}
-
-Write-Host "`n--- PROVISIONING CHANNEL ---"
-Test-TCPPort -TargetHost "provisioning.domotz.com" -Port 4505
-Test-TCPPort -TargetHost "provisioning.domotz.com" -Port 4506
-Test-TCPPort -TargetHost "login.ubuntu.com" -Port 443
-Test-TCPPort -TargetHost "pool.sks-keyservers.net" -Port 11371
-Test-TCPPort -TargetHost "messaging.orchestration.domotz.com" -Port 5671
-Test-TCPPort -TargetHost "api.orchestration.wl-pro.com" -Port 443
-Test-TCPPort -TargetHost "tunny.domotz.org" -Port 55022
-
-Write-Host "`n--- UPDATES FROM CANONICAL ---"
-$canonicalHosts = @(
-    "api.snapcraft.io",
-    "serial-vault-partners.canonical.com",
-    "storage.snapcraftcontent.com",
-    "canonical-lgw01.cdn.snapcraftcontent.com",
-    "canonical-lcy01.cdn.snapcraftcontent.com",
-    "canonical-lcy02.cdn.snapcraftcontent.com",
-    "canonical-bos01.cdn.snapcraftcontent.com",
-    "upload.apps.ubuntu.com"
+# --- UPDATES FROM CANONICAL ---
+echo -e "${YELLOW}--- UPDATES FROM CANONICAL ---${NC}"
+canonical_hosts=(
+  "api.snapcraft.io"
+  "serial-vault-partners.canonical.com"
+  "storage.snapcraftcontent.com"
+  "canonical-lgw01.cdn.snapcraftcontent.com"
+  "canonical-lcy01.cdn.snapcraftcontent.com"
+  "canonical-lcy02.cdn.snapcraftcontent.com"
+  "canonical-bos01.cdn.snapcraftcontent.com"
+  "upload.apps.ubuntu.com"
 )
-foreach ($TargetHost in $canonicalHosts) {
-    Test-TCPPort -TargetHost $TargetHost -Port 443
-}
+for host in "${canonical_hosts[@]}"; do
+  test_tcp_port "$host" 443
+done
 
-Write-Host "`n--- HTTPS SERVERS ---"
-$httpsHosts = @("www.google.com", "www.fast.com", "www.canonical.com", "www.redhat.com")
-foreach ($TargetHost in $httpsHosts) {
-    Test-TCPPort -TargetHost $TargetHost -Port 443
-}
+# --- HTTPS SERVERS ---
+echo -e "${YELLOW}--- HTTPS SERVERS ---${NC}"
+https_hosts=("www.google.com" "www.fast.com" "www.canonical.com" "www.redhat.com")
+for host in "${https_hosts[@]}"; do
+  test_tcp_port "$host" 443
+done
 
-Write-Host "`n--- NTP SERVERS (UDP 123) ---"
-$ntpHosts = @("ntp.ubuntu.com", "0.pool.ntp.org", "1.pool.ntp.org")
-foreach ($TargetHost in $ntpHosts) {
-    Test-UDPPort -TargetHost $TargetHost -Port 123
-}
+# --- NTP SERVERS (UDP 123) ---
+echo -e "${YELLOW}--- NTP SERVERS (UDP 123) ---${NC}"
+ntp_servers=("0.ubuntu.pool.ntp.org" "1.ubuntu.pool.ntp.org" "2.ubuntu.pool.ntp.org")
+for server in "${ntp_servers[@]}"; do
+  test_udp_port "$server" 123
+done
 
-Write-Host "`n--- SPEEDTEST SERVICES ---"
-Test-TCPPort -TargetHost "api.fast.com" -Port 443
-Test-TCPPort -TargetHost "ichnaea-web.netflix.com" -Port 443
-
-# --- Stop transcript ---
-if ($transcriptStarted) {
-    try {
-        Stop-Transcript
-        Start-Sleep -Seconds 2
-    } catch {}
-}
-
-# --- Mask sensitive terms ---
-(Get-Content $logFile) -replace "domotz", "rmm-endpoint" | Set-Content $logFile
-
-# --- Create ZIP file with retry logic ---
-$maxRetries = 5
-$retryCount = 0
-$success = $false
-
-while (-not $success -and $retryCount -lt $maxRetries) {
-    try {
-        Compress-Archive -Path $logCopyPath -DestinationPath $zipPath -Force
-        Remove-Item $logCopyPath -Force
-        $success = $true
-    } catch {
-        Start-Sleep -Seconds 1
-        $retryCount++
-    }
-}
+# --- Final timestamp and attribution ---
+echo "======================================"
+echo "Log completed at: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Log saved to: $log_file"
+echo "Script maintained by: System Admin - Seneathia Willaims"
+echo "======================================"
