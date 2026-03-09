@@ -4,7 +4,7 @@ set -euo pipefail
 # ============================================================
 # Solutionz INC RMM Agent All-in-One Steup(Linux)
 # System Admin: Seneathia Williams
-# Last Updated: 2026-01-27
+# Last Updated: 2026-03-08
 # Description: Performs setup, configuration, and connectivity checks
 # ============================================================
 
@@ -59,10 +59,9 @@ ensure_prereqs() {
   say "apt update"
   apt update
 
-  if ! have_cmd wget && ! have_cmd curl; then
-    say "Installing wget + curl"
-    apt-get install -y wget curl
-  fi
+  # Base tools used by setup + troubleshooting
+  say "Installing base packages (wget, curl, nano, netplan.io)"
+  apt-get install -y wget curl nano netplan.io
 
   if ! have_cmd snap; then
     say "Installing snapd"
@@ -70,6 +69,126 @@ ensure_prereqs() {
   fi
 
   wait_for_snapd
+}
+
+# =========================
+# Netplan + interface naming helpers
+# =========================
+ensure_netplan_template() {
+  local np="/etc/netplan/00-installer-config.yaml"
+
+  # If installer created a blank placeholder (or file missing), populate it with the standard template
+  if [[ ! -s "${np}" ]]; then
+    say "Populating netplan template: ${np}"
+    mkdir -p /etc/netplan
+
+    # Backup any existing netplan YAMLs for safety
+    local bdir="${STATE_DIR}/netplan_backup_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "${bdir}" || true
+    shopt -s nullglob || true
+    for f in /etc/netplan/*.yaml; do
+      cp -a "${f}" "${bdir}/" 2>/dev/null || true
+    done
+    shopt -u nullglob || true
+
+    cat > "${np}" <<'EOF'
+network:
+
+  version: 2
+
+  renderer: networkd
+
+  ethernets:
+
+    eth0:
+
+      dhcp4: true
+
+      dhcp6: false
+
+      accept-ra: false
+
+
+
+    eth1:
+
+      dhcp4: false
+
+      dhcp6: false
+
+      accept-ra: false
+
+      addresses:
+
+        - 192.168.1.71/24
+EOF
+
+    chmod 644 "${np}" || true
+
+    # If cloud-init is managing networking, it can overwrite netplan on reboot.
+    # Disable cloud-init network config only when a cloud-init netplan file exists.
+    if [[ -f /etc/netplan/50-cloud-init.yaml ]] && [[ -d /etc/cloud/cloud.cfg.d ]]; then
+      say "Disabling cloud-init network config (to prevent overwriting netplan)"
+      cat > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg <<'EOF'
+network: {config: disabled}
+EOF
+      chmod 644 /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg || true
+    fi
+  else
+    say "Netplan file already populated: ${np}"
+  fi
+}
+
+ensure_eth_names_next_boot() {
+  # Create systemd .link files to rename interfaces to eth0/eth1 on next boot.
+  # This avoids relying on Ubuntu's predictable interface names (eno/enp/etc).
+  mkdir -p /etc/systemd/network
+
+  local default_if=""
+  default_if="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
+
+  mapfile -t ifs < <(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | sort)
+
+  # Reorder list so default route interface becomes eth0 (if present)
+  if [[ -n "${default_if}" ]]; then
+    local reordered=()
+    for i in "${ifs[@]}"; do
+      [[ "${i}" == "${default_if}" ]] && reordered=("${i}" "${reordered[@]}")
+    done
+    for i in "${ifs[@]}"; do
+      [[ "${i}" != "${default_if}" ]] && reordered+=("${i}")
+    done
+    ifs=("${reordered[@]}")
+  fi
+
+  local idx=0
+  for i in "${ifs[@]}"; do
+    local mac=""
+    mac="$(cat "/sys/class/net/${i}/address" 2>/dev/null || true)"
+    [[ -z "${mac}" ]] && continue
+
+    local eth="eth${idx}"
+    local link="/etc/systemd/network/$((10+idx))-solutionz-${eth}.link"
+
+    cat > "${link}" <<EOF
+[Match]
+MACAddress=${mac}
+
+[Link]
+Name=${eth}
+EOF
+    chmod 644 "${link}" || true
+
+    idx=$((idx+1))
+    [[ "${idx}" -ge 2 ]] && break
+  done
+
+  if [[ "${idx}" -ge 1 ]]; then
+    say "Created systemd link files for eth naming (effective after reboot)."
+    say "Verify after reboot with: ip link show"
+  else
+    say "WARNING: No non-loopback interfaces found to rename."
+  fi
 }
 
 install_snap_phase1_then_stop() {
@@ -102,8 +221,7 @@ REPO_BASE="https://raw.githubusercontent.com/SLZEngineering/domotz-setup/main"
 
 SETUP_SCRIPT="solutionz_domotz_setup_rev2.sh"
 CONFIG_CHECK_SCRIPT="rmm_config_check_dd_v1.sh"
-COLLECTOR_CHECK_SCRIPT="rmm_collector_connection_check_dd_v1"   # no .sh
-
+COLLECTOR_CHECK_SCRIPT="rmm_collector_connection_check_dd_v1.sh"
 DOMOTZ_SNAP="domotzpro-agent-publicstore"
 DOMOTZ_IFACES=(
   "firewall-control"
@@ -370,6 +488,9 @@ main() {
 
   ensure_prereqs
 
+
+  ensure_netplan_template
+  ensure_eth_names_next_boot
   # Phase 1: snap install then STOP to avoid reboot loops
   if ! snap_is_installed; then
     echo "pre_snap" > "${STAGE_FILE}" || true
@@ -406,3 +527,4 @@ main() {
 }
 
 main "$@"
+
