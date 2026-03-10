@@ -1,9 +1,16 @@
+# --- Loop-safety / non-fatal diagnostics ---
+# This script is used as a diagnostic/validation step. It should not cause the full-run pipeline
+# to loop/retry due to non-critical connectivity failures or package install hiccups.
+# We log WARNINGS and always exit 0 at the end.
+set +e
+set +o pipefail 2>/dev/null || true
+export DEBIAN_FRONTEND=noninteractive
 #!/bin/bash
 # ============================
-# Solutionz INC RMM Connection Check (Linux)
-# System Admin: Seneathia Williams
-# Last Updated: 2026-03-08
-# Description: Performs Connection Diagnostics to Confirm RMM Agents Connectivity Access
+# Solutionz INC RMM Connectivity Check (Linux)
+# System Admin: RSW
+# Last Updated: 2026-03-10
+# Description: Performs network diagnostics to verify connectivity to Domotz cloud services.
 # ============================
 
 # --- Ensure script is run with sudo ---
@@ -28,13 +35,19 @@ done
 
 if [ ${#missing_packages[@]} -gt 0 ]; then
   echo "Installing missing packages: ${missing_packages[*]}"
-  apt install "${missing_packages[@]}" -y
+  apt update 2>/dev/null || echo "WARNING: apt update failed (continuing)"
+  apt-get install -y "${missing_packages[@]}" || echo "WARNING: apt install failed for one or more packages (continuing)"
 else
   echo "All required packages are already installed. Skipping installation."
 fi
 
 # --- Log setup ---
 log_file="/var/log/RMM_Connection_Check.txt"
+log_file_fallback="$HOME/RMM_Connection_Check.txt"
+if ! (touch "$log_file" 2>/dev/null); then
+  echo "WARNING: Cannot write to $log_file; using $log_file_fallback"
+  log_file="$log_file_fallback"
+fi
 {
   echo "===== RMM Connectivity Check Log ====="
   echo "Log started at: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -225,5 +238,9 @@ done
 echo "======================================"
 echo "Log completed at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Log saved to: $log_file"
-echo "Script maintained by: System Admin - Seneathia Willaims"
+echo "Script maintained by: System Admin - RSW"
 echo "======================================"
+
+
+# Always exit success so diagnostics do not trigger retry loops
+exit 0
