@@ -3,76 +3,48 @@
 # Solutionz INC RMM All-in-One Auto Run (Linux)
 # System Admin: RSW
 # Last Updated: 2026-03-10
-# Description: Installs and configures the Solutionz RMM collector, then creates the renamed local diagnostic scripts.
+# Description: Remote two-phase installer for the Solutionz RMM collector.
 # Source Base: solutionz_domotz_setup_rev2.sh, rmm_config_check_dd_v1, rmm_collector_connection_check_dd_v1
 # ============================
 
 set -euo pipefail
-exec > >(tee -i RSWSolutionz_RMM_Collector.log)
-exec 2>&1
 
+if [ "${EUID}" -ne 0 ]; then
+  echo "Please run this script with sudo."
+  echo "Example: sudo ./rswsolutionz_rmm_all_in_one_autorun"
+  exit 1
+fi
+
+MASTER_SCRIPT_NAME="rswsolutionz_rmm_all_in_one_autorun"
 SETUP_SCRIPT_NAME="rswsolutionz_domotz_setup_rev2"
 CONFIG_SCRIPT_NAME="rswsolutionz_rmm_config_check_v1"
 CONNECTION_SCRIPT_NAME="rswsolutionz_rmm_collector_connection_check_v1"
 SCRIPT_INSTALL_DIR="/usr/local/bin"
+STATE_DIR="/var/lib/rswsolutionz-rmm"
+STATE_FILE="${STATE_DIR}/install.state"
+PHASE1_MARKER="phase1_complete"
+COMPLETED_MARKER="completed"
+LEGACY_RESUME_SERVICE="solutionz-rmm-resume.service"
+MASTER_LOG="/var/log/RSWSolutionz_RMM_Collector.log"
 
-# --- Display logo and welcome ---
-echo -e "\e[36m
-  _____   ____    _      _    _   _____   _    ____   _     _
- / ____| / __ \\  | |    | |  | | |_   _| | |  / __ \\ | \\   | |  _____
-| (___  | |  | | | |    | |  | |   | |   | | | |  | ||  \\  | | |___ /
- \\___ \\ | |  | | | |    | |  | |   | |   | | | |  | || |\\ \\| |   / /
- ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \\  |  / /__
-|_____/  \\____/  |_____| \\____/    |_|   |_|  \\____/ |_|   \\_| /_____|
+mkdir -p "$STATE_DIR"
+touch "$MASTER_LOG"
+chmod 644 "$MASTER_LOG"
 
-Welcome to the Solutionz INC all-in-one configuration script.
-\e[0m"
+exec > >(tee -a "$MASTER_LOG")
+exec 2>&1
 
-echo "------------------------------------------------------------"
-echo "This script will perform the following actions:"
-echo "1. Update System and install key packages"
-echo "2. Load the 'tun' module if not already loaded"
-echo "3. Install Domotz Pro agent via Snap Store"
-echo "4. Grant permissions to Domotz Pro agent"
-echo "5. Enable UFW Firewall and allow SSH"
-echo "6. Allow port 3000 in UFW"
-echo "7. Configure netplan for DHCP on attached NICs"
-echo "8. Resolve VPN on Demand issue with DNS"
-echo "9. Disable cloud-init's network configuration"
-echo "10. Enable and start SSH service, install package lists"
-echo "11. Add hostnames solzrmm and solz-rmm if they do not exist"
-echo "12. Automatically append kernel parameters to GRUB config"
-echo "13. Configure Serial Console Access on Protectli"
-echo "14. Update Banner"
-echo "15. Create the renamed local RMM config check script"
-echo "16. Create the renamed local RMM connection check script"
-echo "17. Apply executable permissions to all created scripts"
-echo "18. Update GRUB and optionally reboot"
-echo "------------------------------------------------------------"
-echo "Disclaimer:"
-echo
-echo "1. Purpose: This script is designed for the Solutionz RMM Collector and maintained by RSW."
-echo "2. By proceeding, you confirm that:"
-echo "   - The script will modify system configurations and install necessary packages."
-echo "   - It may update system files and settings as per its instructions."
-echo "   - Using this script on an already configured system may lead to unexpected behavior."
-echo "3. Responsibility: You are responsible for any consequences resulting from running this script."
-echo
-read -p "Type 'yes' to proceed: " confirmation1
-if [ "$confirmation1" != "yes" ]; then
-    echo "Confirmation not received. Exiting script."
-    exit 1
-fi
-echo "------------------------------------------------------------"
-echo "Please confirm again to proceed."
-read -p "Type 'yes' to proceed: " confirmation2
-if [ "$confirmation2" != "yes" ]; then
-    echo "Confirmation not received. Exiting script."
-    exit 1
-fi
+read_state() {
+  if [ -f "$STATE_FILE" ]; then
+    cat "$STATE_FILE"
+  else
+    echo "new"
+  fi
+}
 
-export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a
+write_state() {
+  printf '%s\n' "$1" > "$STATE_FILE"
+}
 
 step_message() {
     echo "------------------------------------------------------------"
@@ -84,81 +56,171 @@ progress_message() {
     echo "   [+] $1"
 }
 
-# Step 1
-step_message 1 "Updating System and installing key packages"
-progress_message "Suppressing apt script warnings..."
-echo "Apt::Cmd::Disable-Script-Warning true;" | sudo tee /etc/apt/apt.conf.d/90disablescriptwarning > /dev/null
-progress_message "Updating package lists..."
-sudo apt update
-progress_message "Upgrading packages..."
-sudo apt upgrade -y
-progress_message "Installing required diagnostic and connectivity tools..."
-declare -A packages=(
-  [net-tools]="Legacy networking tools"
-  [openvswitch-switch]="Virtual switch for advanced networking"
-  [traceroute]="Packet path tracing"
-  [dnsutils]="DNS resolution testing"
-  [curl]="HTTP/S data transfer"
-  [openssl]="SSL/TLS diagnostics"
-  [netcat-openbsd]="TCP/UDP connectivity testing"
-  [nano]="Text editor"
-  [iputils-ping]="ICMP ping utility"
-)
-for pkg in "${!packages[@]}"; do
-  if ! dpkg -s "$pkg" &> /dev/null; then
-    progress_message "Installing $pkg - ${packages[$pkg]}"
-    sudo apt install -y "$pkg"
-  else
-    progress_message "$pkg is already installed."
+confirm_from_tty() {
+  local prompt="$1"
+  local answer=""
+  read -r -p "$prompt" answer < /dev/tty
+  printf '%s' "$answer"
+}
+
+print_banner() {
+echo -e "\e[36m
+  _____   ____    _      _    _   _____   _    ____   _     _
+ / ____| / __ \\  | |    | |  | | |_   _| | |  / __ \\ | \\   | |  _____
+| (___  | |  | | | |    | |  | |   | |   | | | |  | ||  \\  | | |___ /
+ \\___ \\ | |  | | | |    | |  | |   | |   | | | |  | || |\\ \\| |   / /
+ ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \\  |  / /__
+|_____/  \\____/  |_____| \\____/    |_|   |_|  \\____/ |_|   \\_| /_____|
+
+Welcome to the Solutionz INC all-in-one remote configuration script.
+\e[0m"
+}
+
+show_phase1_summary() {
+echo "------------------------------------------------------------"
+echo "Phase 1 will perform the following actions:"
+echo "1. Update system and install key packages"
+echo "2. Load the 'tun' module if not already loaded"
+echo "3. Install Domotz Pro agent via Snap Store"
+echo "4. Grant permissions to Domotz Pro agent"
+echo "5. Enable UFW Firewall and allow SSH"
+echo "6. Allow port 3000 in UFW"
+echo "7. Configure netplan for DHCP on attached NICs"
+echo "8. Resolve VPN on Demand issue with DNS"
+echo "9. Disable cloud-init network configuration"
+echo "10. Enable and start SSH service"
+echo "11. Add hostnames solzrmm and solz-rmm if they do not exist"
+echo "12. Append kernel parameters to GRUB config"
+echo "13. Configure serial console access on Protectli"
+echo "14. Update the login banner"
+echo "15. Create the renamed local RMM config check script"
+echo "16. Create the renamed local RMM connection check script"
+echo "17. Remove legacy resume services and apply executable permissions"
+echo "18. Update GRUB and complete Phase 1"
+echo "------------------------------------------------------------"
+echo "This script is intended for remote use."
+echo "It does not auto-reboot and does not create any resume service."
+echo
+echo "After Phase 1, the script will stop and display:"
+echo "  Phase 1 complete. You can reboot now."
+echo
+echo "After the reboot, reconnect remotely and rerun this same script to execute Phase 2."
+echo "------------------------------------------------------------"
+}
+
+show_phase2_summary() {
+echo "------------------------------------------------------------"
+echo "Phase 2 will perform the following actions:"
+echo "19. Run the local RMM config check script"
+echo "20. Run the local RMM connection check script"
+echo "21. Mark the two-phase install complete and show log locations"
+echo "------------------------------------------------------------"
+}
+
+phase1() {
+  print_banner
+  show_phase1_summary
+  echo "Disclaimer:"
+  echo
+  echo "1. Purpose: This script is designed for the Solutionz RMM Collector and maintained by RSW."
+  echo "2. By proceeding, you confirm that:"
+  echo "   - The script will modify system configurations and install necessary packages."
+  echo "   - It may update system files and settings as per its instructions."
+  echo "   - Using this script on an already configured system may lead to unexpected behavior."
+  echo "3. Responsibility: You are responsible for any consequences resulting from running this script."
+  echo
+
+  confirmation1="$(confirm_from_tty "Type 'yes' to proceed with Phase 1: ")"
+  if [ "$confirmation1" != "yes" ]; then
+      echo "Confirmation not received. Exiting script."
+      exit 1
   fi
-done
+  echo "------------------------------------------------------------"
+  echo "Please confirm again to proceed."
+  confirmation2="$(confirm_from_tty "Type 'yes' to proceed with Phase 1: ")"
+  if [ "$confirmation2" != "yes" ]; then
+      echo "Confirmation not received. Exiting script."
+      exit 1
+  fi
 
-# Step 2
-step_message 2 "Loading tun module if not already loaded"
-progress_message "Loading 'tun' module..."
-sudo modprobe tun
-sudo grep -qxF "tun" /etc/modules || echo "tun" | sudo tee -a /etc/modules > /dev/null
+  export DEBIAN_FRONTEND=noninteractive
+  export NEEDRESTART_MODE=a
 
-# Step 3
-step_message 3 "Installing Domotz Pro agent via Snap Store"
-if snap list domotzpro-agent-publicstore >/dev/null 2>&1; then
-    progress_message "Domotz Pro agent is already installed."
-else
-    progress_message "Installing Domotz Pro agent..."
-    sudo snap install domotzpro-agent-publicstore
-fi
+  # Step 1
+  step_message 1 "Updating system and installing key packages"
+  progress_message "Suppressing apt script warnings..."
+  echo "Apt::Cmd::Disable-Script-Warning true;" | tee /etc/apt/apt.conf.d/90disablescriptwarning > /dev/null
+  progress_message "Updating package lists..."
+  apt update
+  progress_message "Upgrading packages..."
+  apt upgrade -y
+  progress_message "Installing required diagnostic and connectivity tools..."
+  declare -A packages=(
+    [net-tools]="Legacy networking tools"
+    [openvswitch-switch]="Virtual switch for advanced networking"
+    [traceroute]="Packet path tracing"
+    [dnsutils]="DNS resolution testing"
+    [curl]="HTTP/S data transfer"
+    [openssl]="SSL/TLS diagnostics"
+    [netcat-openbsd]="TCP/UDP connectivity testing"
+    [nano]="Text editor"
+    [iputils-ping]="ICMP ping utility"
+  )
+  for pkg in "${!packages[@]}"; do
+    if ! dpkg -s "$pkg" &> /dev/null; then
+      progress_message "Installing $pkg - ${packages[$pkg]}"
+      apt install -y "$pkg"
+    else
+      progress_message "$pkg is already installed."
+    fi
+  done
 
-# Step 4
-step_message 4 "Granting permissions to Domotz Pro agent"
-permissions=("firewall-control" "network-observe" "raw-usb" "shutdown" "system-observe")
-for permission in "${permissions[@]}"; do
-    progress_message "Connecting Domotz Pro agent: $permission..."
-    sudo snap connect "domotzpro-agent-publicstore:$permission" || true
-done
+  # Step 2
+  step_message 2 "Loading tun module if not already loaded"
+  progress_message "Loading 'tun' module..."
+  modprobe tun
+  grep -qxF "tun" /etc/modules || echo "tun" >> /etc/modules
 
-# Step 5
-step_message 5 "Enabling UFW Firewall and allow SSH"
-progress_message "Installing and enabling UFW..."
-if ! dpkg -s ufw >/dev/null 2>&1; then
-    sudo apt-get install -y ufw
-    echo "UFW installed successfully."
-else
-    echo "UFW is already installed."
-fi
-progress_message "Allowing SSH through UFW..."
-sudo ufw allow ssh || true
-sudo ufw --force enable
-sudo ufw status verbose
+  # Step 3
+  step_message 3 "Installing Domotz Pro agent via Snap Store"
+  if snap list domotzpro-agent-publicstore >/dev/null 2>&1; then
+      progress_message "Domotz Pro agent is already installed."
+  else
+      progress_message "Installing Domotz Pro agent..."
+      snap install domotzpro-agent-publicstore
+  fi
 
-# Step 6
-step_message 6 "Allowing port 3000 in UFW"
-progress_message "Creating firewall rule"
-sudo ufw allow 3000 || true
+  # Step 4
+  step_message 4 "Granting permissions to Domotz Pro agent"
+  permissions=("firewall-control" "network-observe" "raw-usb" "shutdown" "system-observe")
+  for permission in "${permissions[@]}"; do
+      progress_message "Connecting Domotz Pro agent: $permission..."
+      snap connect "domotzpro-agent-publicstore:$permission" || true
+  done
 
-# Step 7
-step_message 7 "Configuring netplan for DHCP on attached NICs"
-progress_message "Editing netplan configuration file..."
-sudo tee /etc/netplan/00-installer-config.yaml > /dev/null <<'EOL'
+  # Step 5
+  step_message 5 "Enabling UFW firewall and allowing SSH"
+  progress_message "Installing and enabling UFW..."
+  if ! dpkg -s ufw >/dev/null 2>&1; then
+      apt-get install -y ufw
+      echo "UFW installed successfully."
+  else
+      echo "UFW is already installed."
+  fi
+  progress_message "Allowing SSH through UFW..."
+  ufw allow ssh || true
+  ufw --force enable
+  ufw status verbose
+
+  # Step 6
+  step_message 6 "Allowing port 3000 in UFW"
+  progress_message "Creating firewall rule..."
+  ufw allow 3000 || true
+
+  # Step 7
+  step_message 7 "Configuring netplan for DHCP on attached NICs"
+  progress_message "Editing netplan configuration file..."
+  tee /etc/netplan/00-installer-config.yaml > /dev/null <<'EOL'
 network:
     version: 2
     ethernets:
@@ -175,94 +237,93 @@ network:
             dhcp6: false
             accept-ra: false
 EOL
-sudo chmod 600 /etc/netplan/00-installer-config.yaml
-sudo rm -f /etc/netplan/50-cloud-init.yaml
-sudo rm -f /etc/netplan/50-cloud-init.yaml.save
-sudo rm -f /etc/netplan/90-solutionz-config.yaml
-sudo netplan apply
+  chmod 600 /etc/netplan/00-installer-config.yaml
+  rm -f /etc/netplan/50-cloud-init.yaml
+  rm -f /etc/netplan/50-cloud-init.yaml.save
+  rm -f /etc/netplan/90-solutionz-config.yaml
+  netplan apply
 
-# Step 8
-step_message 8 "Resolving VPN on Demand issue with DNS"
-progress_message "Updating /etc/resolv.conf link..."
-if [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
-    sudo mv /etc/resolv.conf /etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)
-fi
-sudo rm -f /etc/resolv.conf
-sudo ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
-ls -l /etc/resolv.conf
+  # Step 8
+  step_message 8 "Resolving VPN on Demand issue with DNS"
+  progress_message "Updating /etc/resolv.conf link..."
+  if [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+      mv /etc/resolv.conf /etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)
+  fi
+  rm -f /etc/resolv.conf
+  ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
+  ls -l /etc/resolv.conf
 
-# Step 9
-step_message 9 "Disabling cloud-init's network configuration"
-progress_message "Creating /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
-echo "network: {config: disabled}" | sudo tee /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg > /dev/null
+  # Step 9
+  step_message 9 "Disabling cloud-init network configuration"
+  progress_message "Creating /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
+  echo "network: {config: disabled}" | tee /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg > /dev/null
 
-# Step 10
-step_message 10 "Enabling SSH Service, install package lists..."
-progress_message "Installing and starting OpenSSH server..."
-sudo apt install -y openssh-server
-sudo systemctl enable ssh
-sudo systemctl start ssh
-sudo systemctl status ssh --no-pager || true
-echo "All requested packages are installed."
+  # Step 10
+  step_message 10 "Enabling SSH service and package support"
+  progress_message "Installing and starting OpenSSH server..."
+  apt install -y openssh-server
+  systemctl enable ssh
+  systemctl start ssh
+  systemctl status ssh --no-pager || true
+  echo "All requested packages are installed."
 
-# Step 11
-step_message 11 "Adding hostnames solzrmm and solz-rmm if they do not exist"
-progress_message "Checking and adding hostname entries to /etc/hosts..."
-HOST_ENTRIES=("127.0.1.1    solzrmm" "127.0.1.1    solz-rmm")
-for entry in "${HOST_ENTRIES[@]}"; do
-    if grep -q "$entry" /etc/hosts; then
-        echo "Hostname entry '$entry' already exists in /etc/hosts."
-    else
-        echo "Adding hostname entry '$entry' to /etc/hosts..."
-        echo "$entry" | sudo tee -a /etc/hosts > /dev/null
-        echo "Hostname entry '$entry' added successfully."
-    fi
-done
+  # Step 11
+  step_message 11 "Adding hostnames solzrmm and solz-rmm if they do not exist"
+  progress_message "Checking and adding hostname entries to /etc/hosts..."
+  HOST_ENTRIES=("127.0.1.1    solzrmm" "127.0.1.1    solz-rmm")
+  for entry in "${HOST_ENTRIES[@]}"; do
+      if grep -q "$entry" /etc/hosts; then
+          echo "Hostname entry '$entry' already exists in /etc/hosts."
+      else
+          echo "Adding hostname entry '$entry' to /etc/hosts..."
+          echo "$entry" | tee -a /etc/hosts > /dev/null
+          echo "Hostname entry '$entry' added successfully."
+      fi
+  done
 
-# Step 12
-step_message 12 "Automatically append kernel parameters to GRUB config"
-progress_message "Safely modify GRUB to disable predictable network interface names"
-GRUB_FILE="/etc/default/grub"
-PARAMS="net.ifnames=0 biosdevname=0"
-echo "Modifying GRUB configuration..."
-sudo cp "$GRUB_FILE" "${GRUB_FILE}.bak"
-if grep -q "^GRUB_CMDLINE_LINUX=" "$GRUB_FILE"; then
-    if ! grep -q "$PARAMS" "$GRUB_FILE"; then
-        sudo sed -i "/^GRUB_CMDLINE_LINUX=/ s/\"\(.*\)\"/\"\1 $PARAMS\"/" "$GRUB_FILE"
-        echo "Added kernel parameters to GRUB_CMDLINE_LINUX."
-    else
-        echo "Kernel parameters already set in GRUB config."
-    fi
-else
-    echo "GRUB_CMDLINE_LINUX=\"$PARAMS\"" | sudo tee -a "$GRUB_FILE" > /dev/null
-    echo "Created GRUB_CMDLINE_LINUX entry with kernel parameters."
-fi
+  # Step 12
+  step_message 12 "Automatically appending kernel parameters to GRUB config"
+  progress_message "Safely modifying GRUB to disable predictable network interface names..."
+  GRUB_FILE="/etc/default/grub"
+  PARAMS="net.ifnames=0 biosdevname=0"
+  cp "$GRUB_FILE" "${GRUB_FILE}.bak"
+  if grep -q "^GRUB_CMDLINE_LINUX=" "$GRUB_FILE"; then
+      if ! grep -q "$PARAMS" "$GRUB_FILE"; then
+          sed -i "/^GRUB_CMDLINE_LINUX=/ s/\"\(.*\)\"/\"\1 $PARAMS\"/" "$GRUB_FILE"
+          echo "Added kernel parameters to GRUB_CMDLINE_LINUX."
+      else
+          echo "Kernel parameters already set in GRUB config."
+      fi
+  else
+      echo "GRUB_CMDLINE_LINUX=\"$PARAMS\"" >> "$GRUB_FILE"
+      echo "Created GRUB_CMDLINE_LINUX entry with kernel parameters."
+  fi
 
-# Step 13
-step_message 13 "Configuring Serial Console Access on Protectli"
-progress_message "Editing GRUB configuration for serial console..."
-sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=".*"/GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8"/' /etc/default/grub
-progress_message "Creating systemd drop-in for serial-getty@ttyS0..."
-sudo mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d
-cat <<'EOF' | sudo tee /etc/systemd/system/serial-getty@ttyS0.service.d/override.conf > /dev/null
+  # Step 13
+  step_message 13 "Configuring serial console access on Protectli"
+  progress_message "Editing GRUB configuration for serial console..."
+  sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=".*"/GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8"/' /etc/default/grub
+  progress_message "Creating systemd drop-in for serial-getty@ttyS0..."
+  mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d
+  cat <<'EOF' > /etc/systemd/system/serial-getty@ttyS0.service.d/override.conf
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty -o -p -- \u --keep-baud 115200,57600,38400,9600 ttyS0 vt220
 EOF
-progress_message "Reloading systemd daemon..."
-sudo systemctl daemon-reexec
-sudo systemctl daemon-reload
-progress_message "Enabling and starting serial-getty@ttyS0 service..."
-sudo systemctl enable serial-getty@ttyS0.service
-sudo systemctl restart serial-getty@ttyS0.service
-progress_message "Verifying agetty process on ttyS0..."
-ps aux | grep '[a]getty' | grep ttyS0 || echo "Warning: agetty not detected on ttyS0"
-echo "Serial console configuration completed."
+  progress_message "Reloading systemd daemon..."
+  systemctl daemon-reexec
+  systemctl daemon-reload
+  progress_message "Enabling and starting serial-getty@ttyS0 service..."
+  systemctl enable serial-getty@ttyS0.service
+  systemctl restart serial-getty@ttyS0.service
+  progress_message "Verifying agetty process on ttyS0..."
+  ps aux | grep '[a]getty' | grep ttyS0 || echo "Warning: agetty not detected on ttyS0"
+  echo "Serial console configuration completed."
 
-# Step 14
-step_message 14 "Update Banner"
-progress_message "Adding Banner"
-sudo tee /etc/update-motd.d/slz-rsw-login > /dev/null <<'EOF'
+  # Step 14
+  step_message 14 "Updating banner"
+  progress_message "Adding banner..."
+  cat <<'EOF' > /etc/update-motd.d/slz-rsw-login
 #!/bin/bash
 # /etc/update-motd.d/slz-rsw-login
 # Custom MOTD for Ubuntu Minimal Server
@@ -296,25 +357,12 @@ echo "IP Addr:  $(hostname -I)"
 echo "============================================================"
 echo " System information as of $(date)"
 EOF
-sudo chmod +x /etc/update-motd.d/slz-rsw-login
+  chmod +x /etc/update-motd.d/slz-rsw-login
 
-echo " System information as of $(date)"
-echo ""
-echo "  System load:  $(uptime | awk -F'load average:' '{print $2}' | cut -d, -f1)"
-echo "  Usage of /:   $(df -h / | awk 'NR==2 {print $5}') of $(df -h / | awk 'NR==2 {print $2}')"
-echo "  Memory usage: $(free | awk '/Mem:/ {printf(\"%.0f%%\", $3/$2*100)}')"
-echo "  Swap usage:   $(free | awk '/Swap:/ {printf(\"%.0f%%\", $3/$2*100)}')"
-echo "  Processes:    $(ps -e | wc -l)"
-echo "  Users logged in: $(who | wc -l)"
-echo "  IPv4 address for eth0: $(ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || true)"
-apt list --upgradable 2>/dev/null | grep -c upgradable | awk '{print $1 " updates can be applied immediately."}'
-echo "To see these additional updates run: apt list --upgradable"
-echo "============================================================"
-
-# Step 15
-step_message 15 "Creating the renamed local RMM config check script"
-progress_message "Writing $SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
-sudo tee "$SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME" > /dev/null <<'EOF'
+  # Step 15
+  step_message 15 "Creating the renamed local RMM config check script"
+  progress_message "Writing $SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
+  cat <<'EOF' > "$SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
 #!/bin/bash
 # ============================
 # Solutionz INC RMM Config Check (Linux)
@@ -445,10 +493,10 @@ echo "Script maintained by: RMM System Admin - RSW"
 echo "======================================"
 EOF
 
-# Step 16
-step_message 16 "Creating the renamed local RMM connection check script"
-progress_message "Writing $SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
-sudo tee "$SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME" > /dev/null <<'EOF'
+  # Step 16
+  step_message 16 "Creating the renamed local RMM connection check script"
+  progress_message "Writing $SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
+  cat <<'EOF' > "$SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
 #!/bin/bash
 # ============================
 # Solutionz INC RMM Connectivity Check (Linux)
@@ -679,26 +727,82 @@ echo "Script maintained by: System Admin - RSW"
 echo "======================================"
 EOF
 
-# Step 17
-step_message 17 "Applying executable permissions to all created scripts"
-progress_message "Setting executable permissions..."
-sudo chmod +x "$SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
-sudo chmod +x "$SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
-progress_message "Saving a local copy of the setup script name for reference..."
-printf '%s
-' "$SETUP_SCRIPT_NAME" | sudo tee /var/log/rswsolutionz_setup_script_name.txt > /dev/null
+  # Step 17
+  step_message 17 "Removing legacy resume services and applying executable permissions"
+  progress_message "Disabling legacy resume service if it exists..."
+  systemctl stop "$LEGACY_RESUME_SERVICE" 2>/dev/null || true
+  systemctl disable "$LEGACY_RESUME_SERVICE" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$LEGACY_RESUME_SERVICE"
+  systemctl daemon-reload || true
+  systemctl reset-failed || true
+  progress_message "Setting executable permissions..."
+  chmod +x "$SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
+  chmod +x "$SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
+  printf '%s\n' "$SETUP_SCRIPT_NAME" > /var/log/rswsolutionz_setup_script_name.txt
 
-# Step 18
-step_message 18 "Update GRUB and optionally reboot"
-progress_message "Running update-grub..."
-sudo update-grub
-echo "------------------------------------------------------------"
-echo "   [+] Setup completed successfully!"
-echo "   [+] Completion Time: $(date)"
-echo "   [+] Hostname: $(hostname)"
-echo "   [+] Setup Script Name: $SETUP_SCRIPT_NAME"
-echo "   [+] Config Check Script: $SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
-echo "   [+] Connection Check Script: $SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
-echo "------------------------------------------------------------"
-read -p "Press Enter to reboot now or Ctrl+C to cancel..." < /dev/tty
-sudo reboot
+  # Step 18
+  step_message 18 "Updating GRUB and completing Phase 1"
+  progress_message "Running update-grub..."
+  update-grub
+  write_state "$PHASE1_MARKER"
+  echo "------------------------------------------------------------"
+  echo "   [+] Phase 1 complete. You can reboot now."
+  echo "   [+] No auto reboot was triggered."
+  echo "   [+] No resume service is enabled."
+  echo "   [+] Reconnect remotely after the reboot and rerun:"
+  echo "       sudo ./$MASTER_SCRIPT_NAME"
+  echo "   [+] Master log: $MASTER_LOG"
+  echo "------------------------------------------------------------"
+}
+
+phase2() {
+  print_banner
+  show_phase2_summary
+
+  # Step 19
+  step_message 19 "Running the local RMM config check script"
+  "$SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
+
+  # Step 20
+  step_message 20 "Running the local RMM connection check script"
+  "$SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
+
+  # Step 21
+  step_message 21 "Marking the install complete and showing log locations"
+  write_state "$COMPLETED_MARKER"
+  echo "------------------------------------------------------------"
+  echo "   [+] Phase 2 complete."
+  echo "   [+] Two-phase install finished successfully."
+  echo "   [+] Master log: $MASTER_LOG"
+  echo "   [+] Config log: /var/log/RSWSolutionz_RMM_Config_Check.log"
+  echo "   [+] Connectivity log: /var/log/RSWSolutionz_RMM_Connection_Check.txt"
+  echo "   [+] Local config script: $SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
+  echo "   [+] Local connection script: $SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
+  echo "------------------------------------------------------------"
+}
+
+current_state="$(read_state)"
+echo "===== RSW Solutionz RMM wrapper started at $(date '+%Y-%m-%d %H:%M:%S') ====="
+echo "Current state: $current_state"
+
+case "$current_state" in
+  new)
+    phase1
+    ;;
+  "$PHASE1_MARKER")
+    phase2
+    ;;
+  "$COMPLETED_MARKER")
+    print_banner
+    echo "A previous two-phase install has already completed on this host."
+    echo "Use the local scripts below for troubleshooting or re-validation:"
+    echo "  $SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
+    echo "  $SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
+    echo "To start over from scratch, remove $STATE_FILE and rerun the wrapper."
+    ;;
+  *)
+    echo "Unknown install state: $current_state"
+    echo "Please review or remove $STATE_FILE before rerunning the wrapper."
+    exit 1
+    ;;
+esac
