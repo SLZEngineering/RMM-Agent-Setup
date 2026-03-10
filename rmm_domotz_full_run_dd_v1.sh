@@ -4,7 +4,7 @@ set -euo pipefail
 # ============================================================
 # Solutionz INC RMM Agent All-in-One Steup(Linux)
 # System Admin: Seneathia Williams
-# Last Updated: 2026-03-08
+# Last Updated: 2026-03-10
 # Description: Performs setup, configuration, and connectivity checks
 # ============================================================
 
@@ -61,7 +61,7 @@ ensure_prereqs() {
 
   # Base tools used by setup + troubleshooting
   say "Installing base packages (wget, curl, nano, netplan.io)"
-  apt-get install -y wget curl nano netplan.io
+  apt-get install -y wget curl nano netplan.io openssh-server
 
   if ! have_cmd snap; then
     say "Installing snapd"
@@ -188,6 +188,28 @@ EOF
     say "Verify after reboot with: ip link show"
   else
     say "WARNING: No non-loopback interfaces found to rename."
+  fi
+}
+ensure_ssh_service_enabled() {
+  # Ubuntu can run sshd via socket activation (ssh.socket). In that case, ssh.service shows "disabled"
+  # even though SSH works. For Solutionz RMM standards, force ssh.service to be enabled and running.
+  say "Configuring SSH to run as ssh.service (service-enabled, not socket-activated)"
+
+  # Ensure package is present
+  if ! dpkg -s openssh-server >/dev/null 2>&1; then
+    apt-get install -y openssh-server
+  fi
+
+  # Prefer service-enabled mode
+  systemctl disable --now ssh.socket >/dev/null 2>&1 || true
+  systemctl unmask ssh.service >/dev/null 2>&1 || true
+  systemctl enable --now ssh.service >/dev/null 2>&1 || true
+
+  # Compatibility: some distros use sshd.service
+  if systemctl list-unit-files --type=service 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then
+    systemctl disable --now sshd.socket >/dev/null 2>&1 || true
+    systemctl unmask sshd.service >/dev/null 2>&1 || true
+    systemctl enable --now sshd.service >/dev/null 2>&1 || true
   fi
 }
 
@@ -491,6 +513,7 @@ main() {
 
   ensure_netplan_template
   ensure_eth_names_next_boot
+  ensure_ssh_service_enabled
   # Phase 1: snap install then STOP to avoid reboot loops
   if ! snap_is_installed; then
     echo "pre_snap" > "${STAGE_FILE}" || true
@@ -527,4 +550,3 @@ main() {
 }
 
 main "$@"
-
