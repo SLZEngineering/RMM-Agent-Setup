@@ -1,365 +1,266 @@
-cat > rswsolutionz_rmm_all_in_one_autorun_fixed <<'EOF'
-#!/bin/bash
-# ============================
-# Solutionz INC RMM All-in-One Auto Run (Linux)
-# System Admin: RSW
-# Last Updated: 2026-03-10
-# Description: Remote two-phase installer for the Solutionz RMM collector.
-# ============================
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-set -euo pipefail
+###############################################################################
+# Script: rswsolutionz_rmm_all_in_one_autorun
+# Purpose: Remote-only two-phase installer/orchestrator for the RSW Solutionz
+#          RMM / Domotz deployment workflow.
+# Modified: 2026-03-11
+# Maintainer: RSW
+###############################################################################
 
-if [ "${EUID}" -ne 0 ]; then
-  echo "Please run this script with sudo."
-  echo "Example: sudo ./rswsolutionz_rmm_all_in_one_autorun_fixed"
-  exit 1
-fi
+SCRIPT_NAME="rswsolutionz_rmm_all_in_one_autorun"
+SCRIPT_VERSION="2026-03-11"
 
-MASTER_SCRIPT_NAME="rswsolutionz_rmm_all_in_one_autorun_fixed"
-CONFIG_SCRIPT_NAME="rswsolutionz_rmm_config_check_v1"
-CONNECTION_SCRIPT_NAME="rswsolutionz_rmm_collector_connection_check_v1"
-SCRIPT_INSTALL_DIR="/usr/local/bin"
 STATE_DIR="/var/lib/rswsolutionz-rmm"
 STATE_FILE="${STATE_DIR}/install.state"
-PHASE1_MARKER="phase1_complete"
-COMPLETED_MARKER="completed"
-LEGACY_RESUME_SERVICE="solutionz-rmm-resume.service"
-MASTER_LOG="/var/log/RSWSolutionz_RMM_Collector.log"
+LOG_FILE="/var/log/rswsolutionz_rmm_all_in_one_autorun.log"
 
-mkdir -p "$STATE_DIR"
-touch "$MASTER_LOG"
-chmod 644 "$MASTER_LOG"
-exec > >(tee -a "$MASTER_LOG")
-exec 2>&1
+LOCAL_BIN="/usr/local/bin"
+SETUP_LOCAL="${LOCAL_BIN}/rswsolutionz_domotz_setup_rev2"
+CONFIG_CHECK_LOCAL="${LOCAL_BIN}/rswsolutionz_rmm_config_check_v1"
+COLLECTOR_CHECK_LOCAL="${LOCAL_BIN}/rswsolutionz_rmm_collector_connection_check_v1"
 
-read_state() {
-  if [ -f "$STATE_FILE" ]; then
-    cat "$STATE_FILE"
+SETUP_URL="https://raw.githubusercontent.com/SLZEngineering/RMM-Agent-Setup/refs/heads/main/rswsolutionz_domotz_setup_rev2"
+WRAPPER_URL="https://raw.githubusercontent.com/SLZEngineering/RMM-Agent-Setup/refs/heads/main/rswsolutionz_rmm_all_in_one_autorun"
+CONFIG_CHECK_URL="https://raw.githubusercontent.com/SLZEngineering/RMM-Agent-Setup/refs/heads/main/rswsolutionz_rmm_config_check_v1"
+COLLECTOR_CHECK_URL="https://raw.githubusercontent.com/SLZEngineering/RMM-Agent-Setup/refs/heads/main/rswsolutionz_rmm_collector_connection_check_v1"
+
+RESUME_SERVICE_NAMES=(
+  "solutionz-rmm-resume.service"
+  "rswsolutionz-rmm-resume.service"
+  "solutionz-rmm-resume.timer"
+  "rswsolutionz-rmm-resume.timer"
+)
+
+on_error() {
+  local exit_code=$?
+  local line_no="${1:-unknown}"
+  echo
+  echo "[ERROR] ${SCRIPT_NAME} failed on line ${line_no} with exit code ${exit_code}."
+  echo "[ERROR] Review ${LOG_FILE} for details."
+  exit "${exit_code}"
+}
+
+trap 'on_error ${LINENO}' ERR
+
+print_header() {
+  echo "============================================================"
+  echo " RSW Solutionz RMM All-In-One Auto Run"
+  echo " Version : ${SCRIPT_VERSION}"
+  echo " Script  : ${SCRIPT_NAME}"
+  echo "============================================================"
+  echo
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "[ERROR] Please run this script with sudo or as root."
+    exit 1
+  fi
+}
+
+prepare_logging() {
+  mkdir -p "${STATE_DIR}"
+  touch "${LOG_FILE}"
+  exec > >(tee -a "${LOG_FILE}") 2>&1
+}
+
+step() {
+  echo
+  echo "STEP $1 - $2"
+  echo "------------------------------------------------------------"
+}
+
+warn() {
+  echo "[WARN] $*"
+}
+
+info() {
+  echo "[INFO] $*"
+}
+
+get_state() {
+  if [[ -f "${STATE_FILE}" ]]; then
+    tr -d '\r\n' < "${STATE_FILE}"
   else
     echo "new"
   fi
 }
 
-write_state() {
-  printf '%s\n' "$1" > "$STATE_FILE"
+set_state() {
+  local new_state="$1"
+  mkdir -p "${STATE_DIR}"
+  printf '%s\n' "${new_state}" > "${STATE_FILE}"
+  info "Install state set to: ${new_state}"
 }
 
-step_message() {
-  echo "------------------------------------------------------------"
-  echo "Step $1: $2"
-  echo "------------------------------------------------------------"
+prompt_for_confirmation() {
+  echo "This script is designed for REMOTE use only."
+  echo "It will perform a TWO-PHASE install."
+  echo "There is NO auto reboot and NO resume service."
+  echo
+  echo "Phase 1 ends with:"
+  echo "  Phase 1 complete. You can reboot now."
+  echo
+  read -r -p "Type yes to continue: " response
+
+  case "${response}" in
+    yes)
+      info "Confirmation received. Continuing."
+      ;;
+    *)
+      echo "Cancelled. No changes were made."
+      exit 1
+      ;;
+  esac
 }
 
-progress_message() {
-  echo "   [+] $1"
+download_file() {
+  local url="$1"
+  local destination="$2"
+
+  curl -fL --retry 3 --retry-delay 2 -o "${destination}" "${url}"
+  chmod +x "${destination}"
 }
 
-confirm_from_tty() {
-  local prompt="$1"
-  local answer=""
-  read -r -p "$prompt" answer < /dev/tty
-  printf '%s' "$answer"
-}
+remove_legacy_resume_services() {
+  local unit
 
-print_banner() {
-cat <<'BANNER'
-  _____   ____    _      _    _   _____   _    ____   _     _
- / ____| / __ \  | |    | |  | | |_   _| | |  / __ \ | \   | |  _____
-| (___  | |  | | | |    | |  | |   | |   | | | |  | ||  \  | | |___ /
- \___ \ | |  | | | |    | |  | |   | |   | | | |  | || |\ \| |   / /
- ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \  |  / /__
-|_____/  \____/  |_____| \____/    |_|   |_|  \____/ |_|   \_| /_____|
-
-Welcome to the Solutionz INC all-in-one remote configuration script.
-BANNER
-}
-
-create_motd() {
-  cat > /etc/update-motd.d/slz-rsw-login <<'MOTD'
-#!/bin/bash
-# /etc/update-motd.d/slz-rsw-login
-# Custom MOTD for Ubuntu Minimal Server
-
-cat << "BANNER"
-  _____   ____    _      _    _   _____   _    ____   _     _
- / ____| / __ \  | |    | |  | | |_   _| | |  / __ \ | \   | |  _____
-| (___  | |  | | | |    | |  | |   | |   | | | |  | ||  \  | | |___ /
- \___ \ | |  | | | |    | |  | |   | |   | | | |  | || |\ \| |   / /
- ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \  |  / /__
-|_____/  \____/  |_____| \____/    |_|   |_|  \____/ |_|   \_| /_____|
-BANNER
-
-echo "Welcome to the Solutionz RMM Collector Login."
-echo "============================================================"
-echo "Solutionz RMM System Admin: RSW"
-echo "------------------------------------------------------------"
-hostnamectl
-echo "------------------------------------------------------------"
-ip a
-echo "------------------------------------------------------------"
-echo "Uptime:   $(uptime -p)"
-echo "Kernel:   $(uname -r)"
-echo "CPU:      $(lscpu | grep 'Model name' | awk -F: '{print $2}' | xargs)"
-echo "Memory:   $(free -h | awk '/Mem:/ {print $3 "/" $2}')"
-echo "Disk:     $(df -h / | awk 'NR==2 {print $3"/"$2 " used"}')"
-echo "IP Addr:  $(hostname -I)"
-echo "============================================================"
-echo "System information as of $(date)"
-MOTD
-  chmod +x /etc/update-motd.d/slz-rsw-login
-}
-
-create_config_script() {
-  cat > "$SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME" <<'CONFIG'
-#!/bin/bash
-set -euo pipefail
-LOG_FILE="/var/log/RSWSolutionz_RMM_Config_Check.log"
-exec > >(tee -a "$LOG_FILE")
-exec 2>&1
-
-echo "===== RSW Solutionz RMM Config Check ====="
-echo "Date: $(date)"
-echo "Hostname: $(hostname)"
-echo ""
-echo "[1] Domotz snap connections"
-snap connections domotzpro-agent-publicstore || true
-echo ""
-echo "[2] SSH status"
-systemctl status ssh --no-pager || true
-echo ""
-echo "[3] Firewall status"
-ufw status verbose || true
-echo ""
-echo "[4] Hostname"
-hostnamectl || true
-echo ""
-echo "[5] IP addressing"
-ip a || true
-echo ""
-echo "[6] Routes"
-ip route || true
-echo ""
-echo "[7] Netplan"
-ls -lah /etc/netplan || true
-for f in /etc/netplan/*.yaml; do
-  [ -e "$f" ] && echo "--- $f ---" && cat "$f"
-done
-CONFIG
-  chmod +x "$SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
-}
-
-create_connection_script() {
-  cat > "$SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME" <<'CONNECT'
-#!/bin/bash
-set -euo pipefail
-LOG_FILE="/var/log/RSWSolutionz_RMM_Connection_Check.txt"
-exec > >(tee -a "$LOG_FILE")
-exec 2>&1
-
-echo "===== RSW Solutionz RMM Connectivity Check ====="
-echo "Date: $(date)"
-echo "Hostname: $(hostname)"
-echo ""
-echo "[1] DNS"
-getent hosts portal.domotz.com || true
-getent hosts echo.domotz.com || true
-echo ""
-echo "[2] HTTPS / TCP"
-nc -z -v -w3 portal.domotz.com 443 || true
-nc -z -v -w3 api-us-east-1-cell-1.domotz.com 443 || true
-nc -z -v -w3 api-eu-west-1-cell-1.domotz.com 443 || true
-echo ""
-echo "[3] ICMP"
-ping -c 2 echo.domotz.com || true
-echo ""
-echo "[4] Snap / Ubuntu"
-nc -z -v -w3 api.snapcraft.io 443 || true
-nc -z -v -w3 login.ubuntu.com 443 || true
-CONNECT
-  chmod +x "$SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
-}
-
-phase1() {
-  print_banner
-  echo "This script is intended for remote use."
-  echo "It does not auto-reboot and does not create any resume service."
-  echo ""
-
-  confirmation1="$(confirm_from_tty "Type 'yes' to proceed with Phase 1: ")"
-  [ "$confirmation1" = "yes" ] || { echo "Confirmation not received. Exiting."; exit 1; }
-
-  confirmation2="$(confirm_from_tty "Type 'yes' to proceed with Phase 1: ")"
-  [ "$confirmation2" = "yes" ] || { echo "Confirmation not received. Exiting."; exit 1; }
-
-  export DEBIAN_FRONTEND=noninteractive
-  export NEEDRESTART_MODE=a
-
-  step_message 1 "Updating system and installing key packages"
-  echo "Apt::Cmd::Disable-Script-Warning true;" > /etc/apt/apt.conf.d/90disablescriptwarning
-  apt update
-  apt upgrade -y
-  apt install -y net-tools openvswitch-switch traceroute dnsutils curl openssl netcat-openbsd nano iputils-ping openssh-server ufw
-
-  step_message 2 "Loading tun module if not already loaded"
-  modprobe tun || true
-  grep -qxF "tun" /etc/modules || echo "tun" >> /etc/modules
-
-  step_message 3 "Installing Domotz Pro agent via Snap Store"
-  if snap list domotzpro-agent-publicstore >/dev/null 2>&1; then
-    progress_message "Domotz Pro agent is already installed."
-  else
-    snap install domotzpro-agent-publicstore
-  fi
-
-  step_message 4 "Granting permissions to Domotz Pro agent"
-  for permission in firewall-control network-observe raw-usb shutdown system-observe; do
-    snap connect "domotzpro-agent-publicstore:$permission" || true
+  for unit in "${RESUME_SERVICE_NAMES[@]}"; do
+    if systemctl list-unit-files | grep -Fq "${unit}"; then
+      warn "Removing legacy unit: ${unit}"
+      systemctl stop "${unit}" 2>/dev/null || true
+      systemctl disable "${unit}" 2>/dev/null || true
+    fi
+    rm -f "/etc/systemd/system/${unit}" || true
   done
 
-  step_message 5 "Enabling UFW firewall and allowing SSH"
-  ufw allow ssh || true
-  ufw --force enable
-  ufw status verbose || true
-
-  step_message 6 "Allowing port 3000 in UFW"
-  ufw allow 3000 || true
-
-  step_message 7 "Configuring netplan for DHCP on attached NICs"
-  cat > /etc/netplan/00-installer-config.yaml <<'NETPLAN'
-network:
-    version: 2
-    ethernets:
-        all-en:
-            match:
-                name: "en*"
-            dhcp4: true
-            dhcp6: false
-            accept-ra: false
-        all-eth:
-            match:
-                name: "eth*"
-            dhcp4: true
-            dhcp6: false
-            accept-ra: false
-NETPLAN
-  chmod 600 /etc/netplan/00-installer-config.yaml
-  rm -f /etc/netplan/50-cloud-init.yaml /etc/netplan/50-cloud-init.yaml.save /etc/netplan/90-solutionz-config.yaml
-  netplan apply || true
-
-  step_message 8 "Resolving VPN on Demand issue with DNS"
-  if [ -e /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
-    mv /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)"
-  fi
-  rm -f /etc/resolv.conf
-  ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
-
-  step_message 9 "Disabling cloud-init network configuration"
-  echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
-
-  step_message 10 "Enabling SSH service"
-  systemctl enable ssh
-  systemctl start ssh
-
-  step_message 11 "Adding hostnames solzrmm and solz-rmm if they do not exist"
-  grep -q '127.0.1.1    solzrmm' /etc/hosts || echo '127.0.1.1    solzrmm' >> /etc/hosts
-  grep -q '127.0.1.1    solz-rmm' /etc/hosts || echo '127.0.1.1    solz-rmm' >> /etc/hosts
-
-  step_message 12 "Appending kernel parameters to GRUB config"
-  GRUB_FILE="/etc/default/grub"
-  PARAMS="net.ifnames=0 biosdevname=0"
-  cp "$GRUB_FILE" "${GRUB_FILE}.bak"
-  if grep -q '^GRUB_CMDLINE_LINUX=' "$GRUB_FILE"; then
-    grep -q "$PARAMS" "$GRUB_FILE" || sed -i "/^GRUB_CMDLINE_LINUX=/ s/\"\(.*\)\"/\"\1 $PARAMS\"/" "$GRUB_FILE"
-  else
-    echo "GRUB_CMDLINE_LINUX=\"$PARAMS\"" >> "$GRUB_FILE"
-  fi
-
-  step_message 13 "Configuring serial console access on Protectli"
-  sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=".*"/GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8"/' /etc/default/grub || true
-  mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d
-  cat > /etc/systemd/system/serial-getty@ttyS0.service.d/override.conf <<'SERIAL'
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty -o -p -- \u --keep-baud 115200,57600,38400,9600 ttyS0 vt220
-SERIAL
-  systemctl daemon-reexec || true
-  systemctl daemon-reload || true
-  systemctl enable serial-getty@ttyS0.service || true
-  systemctl restart serial-getty@ttyS0.service || true
-
-  step_message 14 "Updating banner"
-  create_motd
-
-  step_message 15 "Creating the renamed local RMM config check script"
-  create_config_script
-
-  step_message 16 "Creating the renamed local RMM connection check script"
-  create_connection_script
-
-  step_message 17 "Removing legacy resume services and applying executable permissions"
-  systemctl stop "$LEGACY_RESUME_SERVICE" 2>/dev/null || true
-  systemctl disable "$LEGACY_RESUME_SERVICE" 2>/dev/null || true
-  rm -f "/etc/systemd/system/$LEGACY_RESUME_SERVICE"
   systemctl daemon-reload || true
   systemctl reset-failed || true
-
-  step_message 18 "Updating GRUB and completing Phase 1"
-  update-grub || true
-  write_state "$PHASE1_MARKER"
-  echo "------------------------------------------------------------"
-  echo "   [+] Phase 1 complete. You can reboot now."
-  echo "   [+] No auto reboot was triggered."
-  echo "   [+] No resume service is enabled."
-  echo "   [+] Reconnect remotely after the reboot and rerun:"
-  echo "       sudo ./$MASTER_SCRIPT_NAME"
-  echo "   [+] Master log: $MASTER_LOG"
-  echo "------------------------------------------------------------"
 }
 
-phase2() {
-  print_banner
-  step_message 19 "Running the local RMM config check script"
-  "$SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
+download_repo_scripts() {
+  mkdir -p "${LOCAL_BIN}"
 
-  step_message 20 "Running the local RMM connection check script"
-  "$SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
+  info "Downloading setup script..."
+  download_file "${SETUP_URL}" "${SETUP_LOCAL}"
 
-  step_message 21 "Marking the install complete and showing log locations"
-  write_state "$COMPLETED_MARKER"
-  echo "------------------------------------------------------------"
-  echo "   [+] Phase 2 complete."
-  echo "   [+] Two-phase install finished successfully."
-  echo "   [+] Master log: $MASTER_LOG"
-  echo "   [+] Config log: /var/log/RSWSolutionz_RMM_Config_Check.log"
-  echo "   [+] Connectivity log: /var/log/RSWSolutionz_RMM_Connection_Check.txt"
-  echo "------------------------------------------------------------"
+  info "Downloading config check script..."
+  download_file "${CONFIG_CHECK_URL}" "${CONFIG_CHECK_LOCAL}"
+
+  info "Downloading collector connection check script..."
+  download_file "${COLLECTOR_CHECK_URL}" "${COLLECTOR_CHECK_LOCAL}"
 }
 
-current_state="$(read_state)"
-echo "===== RSW Solutionz RMM wrapper started at $(date '+%Y-%m-%d %H:%M:%S') ====="
-echo "Current state: $current_state"
+syntax_check_repo_scripts() {
+  bash -n "${SETUP_LOCAL}"
+  bash -n "${CONFIG_CHECK_LOCAL}"
+  bash -n "${COLLECTOR_CHECK_LOCAL}"
+  info "Syntax check passed for setup and validation scripts."
+}
 
-case "$current_state" in
-  new)
-    phase1
-    ;;
-  "$PHASE1_MARKER")
-    phase2
-    ;;
-  "$COMPLETED_MARKER")
-    print_banner
-    echo "A previous two-phase install has already completed on this host."
-    echo "Use the local scripts below for troubleshooting or re-validation:"
-    echo "  $SCRIPT_INSTALL_DIR/$CONFIG_SCRIPT_NAME"
-    echo "  $SCRIPT_INSTALL_DIR/$CONNECTION_SCRIPT_NAME"
-    echo "To start over from scratch, remove $STATE_FILE and rerun the wrapper."
-    ;;
-  *)
-    echo "Unknown install state: $current_state"
-    echo "Please review or remove $STATE_FILE before rerunning the wrapper."
+run_phase_1() {
+  step 1 "Display run information"
+  info "Starting Phase 1."
+
+  step 2 "Prompt for confirmation"
+  prompt_for_confirmation
+
+  step 3 "Remove legacy resume services"
+  remove_legacy_resume_services
+
+  step 4 "Create working state folder"
+  mkdir -p "${STATE_DIR}"
+  info "State directory ready: ${STATE_DIR}"
+
+  step 5 "Download the latest setup and check scripts"
+  download_repo_scripts
+
+  step 6 "Syntax check the downloaded scripts"
+  syntax_check_repo_scripts
+
+  step 7 "Run the setup script"
+  bash "${SETUP_LOCAL}"
+
+  step 8 "Write the Phase 1 completion state"
+  set_state "phase1_complete"
+
+  step 9 "Display reboot instruction"
+  echo
+  echo "Phase 1 complete. You can reboot now."
+  echo "After reboot, reconnect remotely and run this same script again."
+}
+
+run_phase_2() {
+  step 10 "Confirm Phase 1 was completed"
+  if [[ "$(get_state)" != "phase1_complete" ]]; then
+    echo "[ERROR] Phase 2 cannot start because the state is not phase1_complete."
+    echo "[ERROR] Current state: $(get_state)"
     exit 1
-    ;;
-esac
-EOF
+  fi
+
+  step 11 "Refresh the local scripts"
+  download_repo_scripts
+
+  step 12 "Syntax check the validation scripts"
+  syntax_check_repo_scripts
+
+  step 13 "Run the configuration validation script"
+  bash "${CONFIG_CHECK_LOCAL}"
+
+  step 14 "Run the collector connection validation script"
+  bash "${COLLECTOR_CHECK_LOCAL}"
+
+  step 15 "Write the completed state"
+  set_state "completed"
+
+  step 16 "Display final completion message"
+  echo
+  echo "Phase 2 complete. Installation and validation are finished."
+}
+
+show_completed_message() {
+  echo
+  echo "The two-phase process has already completed on this device."
+  echo "Current state: $(get_state)"
+  echo
+  echo "Use these commands for validation if needed:"
+  echo "  sudo ${CONFIG_CHECK_LOCAL}"
+  echo "  sudo ${COLLECTOR_CHECK_LOCAL}"
+}
+
+main() {
+  require_root
+  prepare_logging
+  print_header
+
+  local current_state
+  current_state="$(get_state)"
+
+  info "Current install state: ${current_state}"
+  info "Wrapper source URL: ${WRAPPER_URL}"
+
+  case "${current_state}" in
+    new)
+      run_phase_1
+      ;;
+    phase1_complete)
+      run_phase_2
+      ;;
+    completed)
+      show_completed_message
+      ;;
+    *)
+      warn "Unknown state value found: ${current_state}"
+      warn "Resetting state to new and exiting for safety."
+      set_state "new"
+      echo "Please run the script again."
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
     ;;
 esac
