@@ -58,7 +58,7 @@ BANNER
   echo "4. Grant permissions to Domotz Pro agent"
   echo "5. Enable UFW firewall and allow SSH"
   echo "6. Allow port 3000 in UFW"
-  echo "7. Configure netplan for DHCP on attached NICs"
+  echo "7. Configure netplan for eth0 DHCP and eth1 static IP"
   echo "8. Resolve VPN on Demand issue with DNS"
   echo "9. Disable cloud-init network configuration"
   echo "10. Enable and start SSH service and install package lists"
@@ -95,18 +95,15 @@ network:
   version: 2
   renderer: networkd
   ethernets:
-    all-en:
-      match:
-        name: "en*"
+    eth0:
       dhcp4: true
       dhcp6: false
-      optional: true
-    all-eth:
-      match:
-        name: "eth*"
-      dhcp4: true
+
+    eth1:
+      dhcp4: false
       dhcp6: false
-      optional: true
+      addresses:
+        - 192.168.1.100/24
 YAML
   chmod 600 "${NETPLAN_FILE}"
 }
@@ -234,7 +231,7 @@ main() {
   ufw allow 3000/tcp || true
 
   # Step 7
-  step_message 7 "Configuring netplan for DHCP on attached NICs"
+  step_message 7 "Configuring netplan for DHCP on eth0 and static IP on eth1"
   progress_message "Writing netplan configuration file..."
   if [[ -f "${NETPLAN_FILE}" ]]; then
     cp "${NETPLAN_FILE}" "${NETPLAN_FILE}.bak.$(date +%Y%m%d%H%M%S)"
