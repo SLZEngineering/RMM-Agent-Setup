@@ -34,7 +34,6 @@ format_snap_connections() {
 }
 
 # --- Display logo and welcome ---
-echo -e "\033[36m"
 cat <<'EOF'
 
   _____   ____    _      _    _   _____   _    ____   _     _
@@ -46,7 +45,6 @@ cat <<'EOF'
 
 Welcome to the Solutionz INC diagnostic script.
 EOF
-echo -e "\033[0m"
 
 echo "==============================================================================="
 echo "Solutionz INC is now checking the RMM configurations. Please wait a moment..."
