@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ###############################################################################
-# Script: rswsolutionz_domotz_setup_rev3_safe_order
+# Script: rswsolutionz_domotz_setup_rev3_remote_safe
 # Company: Solutionz INC / RSW
 # Last Updated: 2026-03-18
 # Description: Install and configure the Solutionz RMM Collector image.
@@ -72,7 +72,7 @@ BANNER
   echo "12. Append kernel parameters to GRUB config"
   echo "13. Configure serial console access on Protectli"
   echo "14. Update banner"
-  echo "15. Apply netplan near the end"
+  echo "15. Stage netplan without applying it"
   echo "16. Run final validation summary"
   echo "------------------------------------------------------------"
   echo "Disclaimer:"
@@ -80,6 +80,7 @@ BANNER
   echo "2. By proceeding, you confirm that system configurations will be modified."
   echo "3. This script is intended for REMOTE use only."
   echo "4. There is NO automatic reboot."
+  echo "5. Network changes are staged only and are NOT applied automatically during remote install."
   echo
 
   read -r -p "Type 'yes' to proceed: " confirmation1
@@ -109,9 +110,15 @@ YAML
 
 remove_stale_cloud_init_netplans() {
   progress_message "Removing stale cloud-init netplan files if present..."
-  rm -f /etc/netplan/50-cloud-init.yaml
-  rm -f /etc/netplan/50-cloud-init.yaml.save
-  rm -f /etc/netplan/50-cloud-init.*
+  shopt -s nullglob
+  local files=(/etc/netplan/50-cloud-init*)
+  if (( ${#files[@]} > 0 )); then
+    rm -f "${files[@]}"
+    progress_message "Removed stale cloud-init netplan files."
+  else
+    progress_message "No stale cloud-init netplan files found."
+  fi
+  shopt -u nullglob
 }
 
 ensure_host_entry() {
@@ -371,7 +378,6 @@ main() {
   progress_message "Writing netplan configuration file..."
   write_netplan_config
   remove_stale_cloud_init_netplans
-  netplan generate
 
   step_message 9 "Resolve VPN on Demand issue with DNS"
   repair_resolv_conf
@@ -454,9 +460,12 @@ echo "System information as of $(date)"
 EOF
   chmod +x "${MOTD_FILE}"
 
-  step_message 15 "Applying netplan near the end"
-  progress_message "Applying netplan changes now..."
-  netplan apply
+  step_message 15 "Staging netplan for later application"
+  progress_message "Validating netplan configuration syntax..."
+  netplan generate
+
+  progress_message "Netplan configuration staged successfully."
+  progress_message "Skipping netplan apply to avoid interrupting remote access."
 
   update-grub
   printf 'phase1_complete\n' > "${STATE_FILE}"
@@ -468,10 +477,12 @@ EOF
   echo " [+] Setup completed successfully!"
   echo " [+] Completion Time: $(date)"
   echo " [+] Hostname: $(hostname)"
-  echo " [+] Script Version: rev3-safe-order-2026-03-18"
+  echo " [+] Script Version: rev3-remote-safe-2026-03-18"
   echo " [+] State File: ${STATE_FILE}"
   echo "------------------------------------------------------------"
-  echo "Phase 1 complete. You can reboot now."
+  echo "Netplan changes were staged but NOT applied automatically."
+  echo "This was done intentionally to preserve the remote session."
+  echo "Reboot the device or manually run 'netplan apply' during a maintenance window."
   echo "Reconnect after reboot and run the validation scripts as needed."
 }
 
