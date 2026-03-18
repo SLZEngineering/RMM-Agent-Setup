@@ -6,6 +6,12 @@
 # Description: Performs config diagnostics to verify the RMM Collector configuration.
 # ============================
 
+# --- Ensure script is run with sudo ---
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run this script with sudo"
+  exit 1
+fi
+
 # Define log file path
 LOG_FILE="/var/log/RSWSolutionz_RMM_Config_Check.log"
 
@@ -16,9 +22,10 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Function to colorize keywords, IPs, and hostnames
+# Function to colorize keywords, IPs, hostnames, and manual
 colorize() {
   sed -E \
+    -e "s/\b(manual)\b/${GREEN}\1${NC}/g" \
     -e "s/\b(active)\b/${GREEN}\1${NC}/g" \
     -e "s/\b(enabled)\b/${GREEN}\1${NC}/g" \
     -e "s/\b(inactive)\b/${RED}\1${NC}/g" \
@@ -30,7 +37,20 @@ colorize() {
 
 # Helper for snap connections formatting
 format_snap_connections() {
-  snap connections domotzpro-agent-publicstore | column -t
+  if ! snap list | awk '{print $1}' | grep -qx 'domotzpro-agent-publicstore'; then
+    echo "Domotz snap not installed: domotzpro-agent-publicstore"
+    return 1
+  fi
+
+  echo "Interface              Plug                                      Notes"
+  echo "------------------------------------------------------------------------------------------"
+
+  snap connections domotzpro-agent-publicstore | awk '
+    NR==1 {next}
+    {
+      printf "%-22s %-42s %-10s\n", $1, $2, $4
+    }
+  '
 }
 
 # --- Display logo and welcome ---
