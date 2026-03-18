@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ###############################################################################
-# Script: rswsolutionz_domotz_setup_rev3_remote_safe
+# Script: rswsolutionz_domotz_setup_rev3_remote_staged
 # Company: Solutionz INC / RSW
 # Last Updated: 2026-03-18
 # Description: Install and configure the Solutionz RMM Collector image.
@@ -44,18 +44,17 @@ require_root() {
 }
 
 prompt_confirmation() {
-  echo -e "\e[36m"
-  cat <<'BANNER'
- _____ ____  _      _    _ _____ _____ ____  _   _ _______
-/ ____/ __ \| |    | |  | |_   _|_   _/ __ \| \ | |__   __|
-| (___| |  | | |    | |  | | | |   | || |  | |  \| |  | |
- \___ \ |  | | |    | |  | | | |   | || |  | | . ` |  | |
- ____) | |__| | |____| |__| |_| |_ _| || |__| | |\  |  | |
-|_____/ \____/|______|\____/|_____|_____\____/|_| \_|  |_|
-BANNER
-  echo -e "\e[0m"
+  echo -e "\e[36m
+  _____   ____    _      _    _   _____   _    ____   _     _
+ / ____| / __ \  | |    | |  | | |_   _| | |  / __ \ | \   | |  _____
+| (___  | |  | | | |    | |  | |   | |   | | | |  | ||  \  | | |___ /
+ \___ \ | |  | | | |    | |  | |   | |   | | | |  | || |\ \| |   / /
+ ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \  |  / /__
+|_____/  \____/  |_____| \____/    |_|   |_|  \____/ |_|   \_| /_____|
 
-  echo "Welcome to the Solutionz INC configuration script."
+Welcome to the Solutionz INC configuration script.
+\e[0m"
+
   echo "------------------------------------------------------------"
   echo "This script will perform the following actions:"
   echo "1. Update system and install key packages"
@@ -65,8 +64,8 @@ BANNER
   echo "5. Install Domotz Pro agent via Snap Store"
   echo "6. Grant permissions to Domotz Pro agent"
   echo "7. Enable UFW firewall and verify status"
-  echo "8. Prepare netplan for DHCP on eth0 and eth1"
-  echo "9. Repair resolv.conf behavior from attached script"
+  echo "8. Write netplan for eth0 DHCP and eth1 DHCP"
+  echo "9. Repair resolv.conf behavior from prior script"
   echo "10. Disable cloud-init network configuration"
   echo "11. Add hostnames solzrmm and solz-rmm"
   echo "12. Append kernel parameters to GRUB config"
@@ -80,7 +79,7 @@ BANNER
   echo "2. By proceeding, you confirm that system configurations will be modified."
   echo "3. This script is intended for REMOTE use only."
   echo "4. There is NO automatic reboot."
-  echo "5. Network changes are staged only and are NOT applied automatically during remote install."
+  echo "5. Network changes are staged and will apply after reboot."
   echo
 
   read -r -p "Type 'yes' to proceed: " confirmation1
@@ -289,6 +288,10 @@ final_summary_check() {
   grep -E 'solzrmm|solz-rmm' /etc/hosts || true
 
   echo
+  echo "[State File]"
+  cat "${STATE_FILE}" || true
+
+  echo
   echo "============================================================"
 }
 
@@ -432,15 +435,18 @@ EOF
   cat > "${MOTD_FILE}" <<'EOF'
 #!/usr/bin/env bash
 YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
 NC='\033[0m'
-cat <<'BANNER'
- _____ ____  _      _    _ _____ _____ ____  _   _ _______
-/ ____/ __ \| |    | |  | |_   _|_   _/ __ \| \ | |__   __|
-| (___| |  | | |    | |  | | | |   | || |  | |  \| |  | |
- \___ \ |  | | |    | |  | | | |   | || |  | | . ` |  | |
- ____) | |__| | |____| |__| |_| |_ _| || |__| | |\  |  | |
-|_____/ \____/|______|\____/|_____|_____\____/|_| \_|  |_|
-BANNER
+
+echo -e "${CYAN}
+  _____   ____    _      _    _   _____   _    ____   _     _
+ / ____| / __ \  | |    | |  | | |_   _| | |  / __ \ | \   | |  _____
+| (___  | |  | | | |    | |  | |   | |   | | | |  | ||  \  | | |___ /
+ \___ \ | |  | | | |    | |  | |   | |   | | | |  | || |\ \| |   / /
+ ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \  |  / /__
+|_____/  \____/  |_____| \____/    |_|   |_|  \____/ |_|   \_| /_____|
+${NC}"
+
 echo -e "${YELLOW}Welcome to the Solutionz RMM Collector Login.${NC}"
 echo "============================================================"
 echo "Solutionz RMM System Admin: RSW"
@@ -466,6 +472,7 @@ EOF
 
   progress_message "Netplan configuration staged successfully."
   progress_message "Skipping netplan apply to avoid interrupting remote access."
+  progress_message "Network changes will take effect after reboot."
 
   update-grub
   printf 'phase1_complete\n' > "${STATE_FILE}"
@@ -477,12 +484,12 @@ EOF
   echo " [+] Setup completed successfully!"
   echo " [+] Completion Time: $(date)"
   echo " [+] Hostname: $(hostname)"
-  echo " [+] Script Version: rev3-remote-safe-2026-03-18"
+  echo " [+] Script Version: rev3-remote-staged-2026-03-18"
   echo " [+] State File: ${STATE_FILE}"
   echo "------------------------------------------------------------"
   echo "Netplan changes were staged but NOT applied automatically."
   echo "This was done intentionally to preserve the remote session."
-  echo "Reboot the device or manually run 'netplan apply' during a maintenance window."
+  echo "Reboot the device when ready for the staged network configuration to take effect."
   echo "Reconnect after reboot and run the validation scripts as needed."
 }
 
