@@ -64,7 +64,7 @@ Welcome to the Solutionz INC configuration script.
   echo "5. Install Domotz Pro agent via Snap Store"
   echo "6. Grant permissions to Domotz Pro agent"
   echo "7. Enable UFW firewall and verify status"
-  echo "8. Write netplan for eth0 DHCP and eth1 DHCP"
+  echo "8. Write netplan for eth0 DHCP and eth1 DHCP with preferred routing on eth0"
   echo "9. Repair resolv.conf behavior from prior script"
   echo "10. Disable cloud-init network configuration"
   echo "11. Add hostnames solzrmm and solz-rmm"
@@ -79,7 +79,8 @@ Welcome to the Solutionz INC configuration script.
   echo "2. By proceeding, you confirm that system configurations will be modified."
   echo "3. This script is intended for REMOTE use only."
   echo "4. There is NO automatic reboot."
-  echo "5. Network changes are staged and will apply after reboot."
+  echo "5. Network changes are staged and will apply only after reboot."
+  echo "6. Collector connectivity validation must be run after reboot."
   echo
 
   read -r -p "Type 'yes' to proceed: " confirmation1
@@ -100,9 +101,14 @@ network:
     eth0:
       dhcp4: true
       dhcp6: false
+      dhcp4-overrides:
+        route-metric: 100
+
     eth1:
       dhcp4: true
       dhcp6: false
+      dhcp4-overrides:
+        route-metric: 200
 YAML
   chmod 600 "${NETPLAN_FILE}"
 }
@@ -490,7 +496,7 @@ EOF
   echo "Netplan changes were staged but NOT applied automatically."
   echo "This was done intentionally to preserve the remote session."
   echo "Reboot the device when ready for the staged network configuration to take effect."
-  echo "Reconnect after reboot and run the validation scripts as needed."
+  echo "Run the collector connection check only after reboot."
 }
 
 main "$@"
