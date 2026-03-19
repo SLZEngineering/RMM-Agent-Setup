@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+trap 'echo " [!] ERROR on line ${LINENO}: ${BASH_COMMAND}"' ERR
 
 ###############################################################################
 # Script: rswsolutionz_domotz_setup_rev3_remote_staged
@@ -182,6 +183,48 @@ repair_resolv_conf() {
   ls -l "${RESOLV_FILE}"
 }
 
+install_missing_packages() {
+  local packages=(
+    net-tools
+    openvswitch-switch
+    traceroute
+    dnsutils
+    curl
+    openssl
+    netcat-openbsd
+    nano
+    iputils-ping
+    ufw
+    snapd
+    openssh-server
+  )
+
+  local missing=()
+  for pkg in "${packages[@]}"; do
+    if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
+      missing+=("${pkg}")
+    fi
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    progress_message "Installing missing packages: ${missing[*]}"
+    apt install -y "${missing[@]}"
+  else
+    progress_message "All required packages are already installed."
+  fi
+}
+
+wait_for_snapd() {
+  local tries=0
+  until systemctl is-active snapd >/dev/null 2>&1; do
+    ((tries++))
+    if (( tries > 12 )); then
+      error_exit "snapd did not become active in time."
+    fi
+    sleep 2
+  done
+}
+
 verify_required_packages() {
   progress_message "Verifying required packages..."
   local required=(
@@ -321,29 +364,7 @@ main() {
   apt upgrade -y
 
   progress_message "Installing required diagnostic and connectivity tools..."
-  required_packages=(
-    net-tools
-    openvswitch-switch
-    traceroute
-    dnsutils
-    curl
-    openssl
-    netcat-openbsd
-    nano
-    iputils-ping
-    ufw
-    snapd
-    openssh-server
-  )
-
-  for pkg in "${required_packages[@]}"; do
-    if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
-      progress_message "Installing ${pkg}..."
-      apt install -y "${pkg}"
-    else
-      progress_message "${pkg} is already installed."
-    fi
-  done
+  install_missing_packages
 
   step_message 2 "Verifying required packages"
   verify_required_packages
@@ -360,6 +381,9 @@ main() {
   progress_message "Ensuring snapd is enabled..."
   systemctl enable --now snapd || true
   systemctl enable --now snapd.socket || true
+
+  progress_message "Waiting for snapd service to become active..."
+  wait_for_snapd
 
   if ! snap list | awk '{print $1}' | grep -qx 'domotzpro-agent-publicstore'; then
     progress_message "Installing Domotz Pro agent..."
