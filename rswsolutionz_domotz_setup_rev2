@@ -5,7 +5,7 @@ trap 'echo " [!] ERROR on line ${LINENO}: ${BASH_COMMAND}"' ERR
 ###############################################################################
 # Script: rswsolutionz_domotz_setup_rev3_remote_staged
 # Company: Solutionz INC / RSW
-# Last Updated: 2026-03-18
+# Last Updated: 2026-03-18 Version 2026.01
 # Description: Install and configure the Solutionz RMM Collector image.
 # Usage: Remote-only execution. Manual reboot at the end.
 ###############################################################################
